@@ -215,3 +215,49 @@ and the feature at the same time.
 - Windows `mkdir -p`-style nested directory creation is not guaranteed
   the same way as on Unix; worth verifying directory structure exists
   before assuming it from an earlier step, especially on this platform
+
+  
+## Phase 1 — Job Validation Schema and Job Service
+
+**Date:** 2026-09-08
+
+### What we built
+- `src/validation/jobSchema.ts` — Zod schema for `POST /api/jobs` input
+  (`type`: non-empty string, `payload`: object), with `CreateJobInput`
+  type derived via `z.infer`
+- `src/services/jobService.ts` — `createJob` (parameterized INSERT with
+  RETURNING) and `getJobById` (parameterized SELECT), both using the
+  real connection pool
+
+### Why
+Validation and persistence logic are built and manually proven correct
+in isolation, before either touches Express — keeping HTTP concerns
+completely separate from input-shape rules and SQL.
+
+### Problems encountered
+- See `incidents-and-failures.md`, Incident 2 (`noUncheckedIndexedAccess`
+  flagging `createJob`'s return type)
+
+### Tests performed
+- Manual script exercising `createJobSchema.safeParse` with one valid
+  and two invalid inputs — confirmed correct pass/fail behavior and
+  error messages, then removed the throwaway test file
+- Manual end-to-end run via `index.ts`: called `createJob`, confirmed a
+  real row was inserted into Postgres with correct defaults (UUID,
+  `QUEUED` status, `attempt_count: 0`, `max_attempts: 5`, timestamps);
+  called `getJobById` with the returned id, confirmed the same row was
+  fetched back correctly
+
+### What remains to be tested
+- Express route wiring (next step)
+- Behavior when `getJobById` is called with a non-existent id (should
+  return `null` per its type signature — not yet exercised)
+- Automated tests (deferred to Phase 9, currently only manual scripts)
+
+### New risks introduced
+- None; still pre-HTTP, isolated logic only
+
+### What we learned
+- `noUncheckedIndexedAccess` is a genuinely useful strictness setting
+  for this project, not just friction — it caught a real implicit
+  assumption in `createJob`

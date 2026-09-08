@@ -36,3 +36,36 @@ default, and what we're using) needs `module` and `verbatimModuleSyntax`
 explicitly aligned with that choice — the generated config is not
 plug-and-play for every project type, and the error messages, while
 initially alarming, directly named the fix.
+
+
+## Incident 2 — noUncheckedIndexedAccess flags createJob's return as possibly undefined
+
+**Date:** 2026-09-08
+
+**Expected behavior:** `createJob` compiles cleanly, returning `Job`.
+
+**Actual behavior:** TypeScript error TS2322 — `result.rows[0]` typed as
+`Job | undefined`, not assignable to the declared `Promise<Job>` return
+type.
+
+**How it was reproduced:** Ran `npm run dev` after writing
+`jobService.ts` with `return result.rows[0];` in `createJob`.
+
+**Root cause:** `tsconfig.json` has `"noUncheckedIndexedAccess": true`,
+which makes TypeScript treat all array index access as potentially
+`undefined`, since the type system cannot prove an INSERT...RETURNING
+query always returns a row.
+
+**Fix:** Added an explicit runtime check — if `result.rows[0]` is
+falsy, throw an explicit error instead of silently returning
+`undefined`. This satisfies the type checker and adds a real safety net
+if the assumption (INSERT always returns exactly one row) is ever
+violated by a future change.
+
+**Verification:** `npm run dev` compiled and ran successfully;
+`createJob` returned a real inserted row from Postgres.
+
+**Engineering lesson:** `noUncheckedIndexedAccess` is doing its job
+correctly here — it's not a nuisance to silence, it's forcing an
+explicit decision about what happens in a case the code was implicitly
+assuming away.
