@@ -163,3 +163,55 @@ both consumers, rather than retrofitted onto the worker later.
 ### What we learned
 - Nothing new — confirms the API scaffolding process is repeatable and
   the earlier `cd` mistake was avoidable once understood
+
+
+## Phase 1 — Environment Config, DB Pool, and jobs Table
+
+**Date:** 2026-09-08
+
+### What we built
+- Zod-validated environment configuration (`src/config/env.ts`)
+- PostgreSQL connection pool (`src/db/pool.ts`) using `pg`, verified
+  against the real running container with a `SELECT NOW()` query
+- `jobs` table schema (`infra/init-db/001_create_jobs_table.sql`),
+  applied directly to the running Postgres container and verified via
+  `\d jobs`
+
+### Why
+Establishing config validation and a real, proven DB connection before
+writing any route/business logic means later code can be written
+against a known-working foundation instead of debugging the foundation
+and the feature at the same time.
+
+### Problems encountered
+1. TypeScript `verbatimModuleSyntax`/CommonJS conflict — see
+   `incidents-and-failures.md`, Incident 1.
+2. `infra/init-db/` directory was missing when we went to create the SQL
+   file, despite being part of the original Phase 0 folder structure.
+   Cause not fully determined (possibly never actually created in the
+   original batch `mkdir -p`, since Windows `mkdir` does not support
+   `-p` the same way and may have silently failed on nested paths).
+   Fix: recreated the directory directly before creating the SQL file.
+   No data loss since the folder was never used before this point.
+
+### Tests performed
+- `npm run dev` with real DB pool — confirmed live connection to
+  Postgres container via `SELECT NOW()`, returned real timestamp
+- Ran table creation SQL directly against the container via
+  `docker exec` + `psql`, confirmed `CREATE EXTENSION`, `CREATE TABLE`,
+  `CREATE INDEX` all succeeded
+- `\d jobs` — confirmed real schema matches design: all columns, types,
+  defaults, primary key, status index, and CHECK constraint present
+
+### What remains to be tested
+- Actual INSERT via application code (job service, next step)
+- Behavior when the CHECK constraint is violated (deferred until we
+  write code that could trigger it)
+
+### New risks introduced
+- None; schema only, no application logic writing to it yet
+
+### What we learned
+- Windows `mkdir -p`-style nested directory creation is not guaranteed
+  the same way as on Unix; worth verifying directory structure exists
+  before assuming it from an earlier step, especially on this platform
