@@ -312,3 +312,12 @@ both proven end-to-end with real HTTP requests. RabbitMQ, retries, and
 the dashboard are explicitly out of scope for this phase per the
 original brief — jobs currently just sit as QUEUED with nothing moving
 them forward, which is expected until Phase 2.
+
+
+### Addendum — 404 path verified
+
+`GET /api/jobs/:id` with a non-existent id was manually tested over
+real HTTP: returned `404` with `{"error":"Job not found"}`, logged
+correctly via pino-http. All three response paths for Phase 1
+(`201`, `400`, `404`) are now confirmed against the real running
+server, not just assumed from code review.
