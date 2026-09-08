@@ -1,0 +1,1 @@
+console.log("DeadLetter Worker — scaffolding check");

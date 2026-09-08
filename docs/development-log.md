@@ -127,3 +127,39 @@ one-line file.
 - `tsc --init`'s generated config is not immediately usable as-is for a
   Node project — `rootDir`/`outDir` and the `types` array need explicit
   configuration
+
+  
+## Phase 0 — Worker Project Scaffolding
+
+**Date:** 2026-09-08
+
+### What we built
+- Initialized `apps/worker` as an npm workspace member, mirroring the
+  `apps/api` scaffolding: TypeScript + `@types/node`, configured
+  `tsconfig.json` (rootDir/outDir, node types), `build`/`start`/`dev`
+  npm scripts
+- Verified the compile-and-run pipeline with a trivial entry point
+
+### Why
+The worker is a separate process from the API but will eventually share
+code (job status types, DB models) via `packages/shared`. Scaffolding
+both apps identically now means shared code can be introduced once, for
+both consumers, rather than retrofitted onto the worker later.
+
+### Problems encountered
+- None — this repeated the exact steps already debugged for `apps/api`,
+  so no new issues surfaced.
+
+### Tests performed
+- `npm run dev` inside `apps/worker` — compiled and ran successfully,
+  printed expected output
+
+### What remains to be tested
+- No real worker logic yet (RabbitMQ consumption starts Phase 2/3)
+
+### New risks introduced
+- None; scaffolding only
+
+### What we learned
+- Nothing new — confirms the API scaffolding process is repeatable and
+  the earlier `cd` mistake was avoidable once understood
