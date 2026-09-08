@@ -261,3 +261,54 @@ completely separate from input-shape rules and SQL.
 - `noUncheckedIndexedAccess` is a genuinely useful strictness setting
   for this project, not just friction — it caught a real implicit
   assumption in `createJob`
+
+  
+## Phase 1 — Express App, Job Routes, End-to-End Verification
+
+**Date:** 2026-09-08
+
+### What we built
+- `src/app.ts` — Express app with `pino-http` structured request logging
+  and JSON body parsing
+- `src/routes/jobs.ts` — `POST /api/jobs` and `GET /api/jobs/:id`,
+  wired to the validation schema and job service
+- `src/index.ts` updated to actually start the HTTP server
+- `GET /api/health` as a minimal liveness route
+
+### Why
+This is the point where validation, persistence, and HTTP finally
+connect into the real request lifecycle described in the Phase 1 goal.
+
+### Tests performed (all against the real running server + database)
+- `GET /api/health` — 200, confirmed pino-http logs both an explicit
+  log line and an automatic "request completed" line, both tagged with
+  the same request id
+- `POST /api/jobs` with valid body — 201, real job persisted, real
+  jobId returned, confirmed via server log
+- `GET /api/jobs/:id` with that real id — 200, full job row returned,
+  matched what was created
+- `POST /api/jobs` with `{}` — 400, Zod correctly reported both missing
+  fields (`type`, `payload`) in the response body
+
+### What remains to be tested
+- `GET /api/jobs/:id` with a non-existent id (404 path — schema
+  supports it via `getJobById` returning `null`, not yet exercised via
+  HTTP)
+- Automated tests (Phase 9)
+- Behavior under concurrent requests
+
+### New risks introduced
+- None beyond what already existed; this wires together already-proven
+  pieces
+
+### What we learned
+- pino-http's automatic request id correlation works as designed —
+  visibly confirmed in real log output, not just assumed from docs
+
+## Phase 1 — Status: Core loop complete
+
+Submit → validate → persist → return jobId + QUEUED, and fetch by id,
+both proven end-to-end with real HTTP requests. RabbitMQ, retries, and
+the dashboard are explicitly out of scope for this phase per the
+original brief — jobs currently just sit as QUEUED with nothing moving
+them forward, which is expected until Phase 2.
