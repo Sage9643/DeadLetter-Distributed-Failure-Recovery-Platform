@@ -162,3 +162,63 @@ than theoretical, ahead of building idempotency protection.
 
 **Cleanup:** Artificial delay removed from `consumer.ts` after the
 test; confirmed clean recompile with no errors.
+
+
+## Deliberate Test 2 — Reproducing the DB/RabbitMQ consistency problem
+
+**Date:** 2026-09-09
+
+**Purpose:** Directly reproduce and observe the DB-write-succeeds-but-
+publish-fails scenario tracked since Phase 0's architecture.md, rather
+than solving it speculatively without evidence.
+
+**Setup:** Stopped the RabbitMQ container (`docker compose stop
+rabbitmq`) while leaving PostgreSQL running, simulating a broker outage
+while the database remains available.
+
+**Procedure:**
+1. Confirmed via `docker compose ps`: PostgreSQL healthy, RabbitMQ
+   stopped
+2. Started the API fresh — confirmed it boots successfully even with
+   RabbitMQ down (connection is lazy; only attempted on first publish,
+   not at startup)
+3. Sent `POST /api/jobs` with `type: "consistency_test"`
+
+**Observed behavior:**
+- Request returned HTTP `500` after ~462ms, with a raw, unhandled
+  `AggregateError [ECONNREFUSED]` stack trace leaked directly to the
+  client as an HTML error page — not a clean JSON error response
+- pino-http's error log captured its own internal wrapper message
+  ("failed with status code 500") rather than the actual underlying
+  `ECONNREFUSED` cause — the real error was only visible via the raw
+  stack trace printed separately to the console, not through our
+  structured logging
+- Direct query against PostgreSQL confirmed: a real job row was
+  persisted — `id: 4581724a-1155-4dcf-a98b-da7e0a640582`,
+  `type: consistency_test`, `status: QUEUED`, with a real timestamp
+- This job will remain `QUEUED` forever. No message was ever published
+  to RabbitMQ, so no worker will ever learn this job exists. There is
+  currently no mechanism in the system to detect or recover this job.
+
+**Conclusion:** The tracked consistency problem is real and reproducible
+on demand, not a theoretical edge case. The current implementation has
+no defense against it — `jobService.createJob` performs the INSERT and
+the publish as two independent, non-atomic steps, in sequence, with no
+compensating action if the second step fails after the first succeeds.
+
+**Secondary findings from this test** (worth fixing regardless of the
+consistency decision):
+1. Unhandled errors in route handlers currently leak raw stack traces
+   to clients via Express's default error handler — no centralized
+   error-handling middleware exists yet.
+2. Structured logging does not currently capture the true root cause of
+   an error clearly — pino-http logs its own wrapper, not necessarily
+   the original exception in an easily greppable form.
+
+**Not fixed yet — deliberately.** Per the original project plan, we are
+not implementing a fix (e.g., the transactional outbox pattern) until
+this evidence exists and can inform the decision. See
+`engineering-decisions.md` for the options now under real consideration.
+
+**Test data:** The stuck job (`4581724a-1155-4dcf-a98b-da7e0a640582`)
+was left in the database as evidence rather than deleted.

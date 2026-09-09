@@ -59,3 +59,55 @@ such conflict encountered so far.
 **Consequences:** All future files in `apps/api` and `apps/worker` are
 written and compiled as CommonJS. `packages/shared`, when introduced,
 should follow the same convention for consistency.
+
+
+## Open Decision: How to handle DB/RabbitMQ publish failure after a successful DB write
+
+**Context:** Deliberate Test 2 (see incidents-and-failures.md) confirmed
+that when PostgreSQL succeeds but the subsequent RabbitMQ publish fails
+(e.g., broker unavailable), a job is left permanently stuck as `QUEUED`
+with no worker ever notified, and no current mechanism to detect this.
+
+**Status:** NOT YET DECIDED. Documenting real options now that evidence
+exists, per the project's rule against solving this prematurely.
+
+**Options under consideration:**
+
+1. **Transactional outbox pattern** — write the job and an "outbox"
+   record to Postgres in the same transaction; a separate process polls
+   the outbox table and publishes to RabbitMQ, marking outbox rows as
+   sent. Guarantees the DB write and the "intent to publish" are
+   atomic; publishing itself becomes retryable and recoverable from the
+   outbox table if it fails.
+   - Trade-off: adds a new table, a new background process (or polling
+     loop), and publish latency now depends on the outbox poller's
+     interval rather than being immediate.
+
+2. **Reconciliation job** — a periodic background job that queries for
+   jobs stuck in `QUEUED` beyond some threshold with no corresponding
+   activity, and re-publishes them.
+   - Trade-off: simpler than an outbox, but introduces a detection
+     delay (jobs are stuck until the reconciliation job runs), and
+     still needs a way to know "this job was never actually published"
+     vs. "this job is legitimately still waiting to be processed."
+
+3. **Do nothing yet; return a clear error and let the client retry** —
+   accept that publish failures are visible to the client (via a
+   proper error response, not today's raw stack trace) and rely on the
+   client to retry job submission.
+   - Trade-off: pushes the reliability burden to API clients; doesn't
+     protect against the case where the client doesn't retry, or
+     assumes success.
+
+**Why no decision yet:** This requires weighing added complexity
+(outbox/reconciliation) against how much reliability this project
+genuinely needs to demonstrate, and interacts with retry/DLQ design
+(Phase 4) that hasn't been built yet. Revisiting once Phase 4's retry
+architecture exists, since the two problems may share a solution shape
+(both are fundamentally about "how do we recover work that got stuck").
+
+**Immediate, uncontroversial fix (separate from the above, and worth
+doing regardless):** centralized error-handling middleware in Express,
+so unhandled errors return clean JSON responses instead of leaking raw
+stack traces — this is a real bug independent of which consistency
+strategy we eventually choose.
