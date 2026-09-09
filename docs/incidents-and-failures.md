@@ -222,3 +222,53 @@ this evidence exists and can inform the decision. See
 
 **Test data:** The stuck job (`4581724a-1155-4dcf-a98b-da7e0a640582`)
 was left in the database as evidence rather than deleted.
+
+
+## Incident 4 — Malformed jobId caused infinite redelivery loop
+
+**Date:** 2026-09-09
+
+**Expected behavior:** A message with an invalid jobId should be safely
+discarded, similar to how malformed JSON is already handled.
+
+**Actual behavior:** During manual Phase 5 concurrency testing, a
+message was accidentally published via the RabbitMQ UI with the literal
+placeholder text `{"jobId":"<paste the jobId here>"}` instead of a real
+UUID. claimJob()'s parameterized query passed this string directly to
+Postgres as a UUID column parameter, which Postgres rejected with error
+code 22P02 (invalid_text_representation). The consumer's catch block
+treated ALL thrown errors during claim as transient infrastructure
+failures and unconditionally NACKed with requeue=true. Since the error
+is deterministic (the string will never become a valid UUID), this
+caused an infinite redelivery loop -- confirmed via RabbitMQ UI showing
+sustained ~31 deliveries/sec with a matching ~31/sec Redelivered rate,
+Unacked=1 held continuously.
+
+**How it was reproduced:** Deliberately re-triggered by publishing
+`{"jobId":"not-a-real-uuid"}` via the RabbitMQ UI after the fix was
+implemented, to confirm both the original failure mode and the fix.
+
+**Root cause:** No distinction was made between a permanently malformed
+message (unrecoverable, should never be retried) and a genuine
+transient infrastructure error (recoverable, should be requeued) when
+an error occurred during the claim attempt.
+
+**Fix:** Added `isInvalidTextRepresentationError()`, checking for
+Postgres error code 22P02 specifically. When detected, the message is
+ACKed and discarded (same treatment as malformed JSON) instead of
+requeued. All other errors during claim continue to be treated as
+infrastructure failures and requeued, unchanged.
+
+**Verification:** Reproduced the exact failure with a deliberately
+invalid jobId after the fix; confirmed exactly one log line
+("Malformed jobId (invalid UUID)...") with no loop, and RabbitMQ UI
+showing a single delivery spike with zero redelivery activity,
+Ready/Unacked/Total all settling at 0.
+
+**Engineering lesson:** Not all errors caught in a broad try/catch are
+equivalent. Treating "the operation failed" as a single category
+(rather than distinguishing permanent/data-level failures from
+transient/infrastructure failures) can turn a trivial bad-input mistake
+into a sustained resource-consuming loop. This was found through manual
+testing, not code review -- a concrete argument for why the project's
+emphasis on real execution over assumed correctness matters.

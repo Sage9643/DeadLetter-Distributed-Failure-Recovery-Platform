@@ -125,3 +125,14 @@ New exchange: `deadletter.jobs.failures.exchange` (direct), worker-only
 RabbitMQ continues to provide at-least-once delivery only, never
 exactly-once. This applies to retry-queue redelivery as well as original
 delivery.
+
+
+## Phase 5 update
+
+No topology changes -- duplicate and concurrent deliveries are now
+handled entirely at the PostgreSQL layer via claimJob's atomic
+conditional UPDATE, not by any RabbitMQ-level mechanism. RabbitMQ
+continues to provide only at-least-once delivery; deduplication and
+concurrency safety are the consuming application's responsibility, now
+correctly implemented and verified under a real concurrent race. See
+failure-handling.md and development-log.md (Test 4).

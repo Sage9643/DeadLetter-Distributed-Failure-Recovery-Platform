@@ -82,3 +82,20 @@ terminal (a RETRYING job redelivered via TTL expiry must be reprocessed).
   strictly guaranteed by RabbitMQ's implementation. Not expected to
   matter at this project's scale/testing, but noted as a known RabbitMQ
   behavior, not a bug in our code.
+
+  
+## Phase 5 test-mechanism correction (pre-execution)
+
+CLAIM_TEST_DELAY_MS (relative, per-message delay) was replaced with
+CLAIM_TEST_SYNC_EPOCH_MS (absolute shared target timestamp) before any
+tests were executed, after review determined the relative-delay
+approach could not reliably guarantee two independent worker processes'
+claim attempts genuinely overlap in time. See engineering-decisions.md
+for full rationale. claimJob() itself is unaffected -- this is a
+test-harness-only change.
+
+Test 3's actual guarantee was also clarified: it demonstrates rejection
+of a duplicate delivered AFTER a job is already COMPLETED (terminal
+exclusion), not a live PROCESSING-state race -- that guarantee is
+demonstrated by Test 4 alone, which is the only test using >= 2
+concurrent consumers.

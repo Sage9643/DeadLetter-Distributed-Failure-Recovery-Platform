@@ -104,3 +104,32 @@ the separation of concerns established in Phase 2.
 
 See message-flow.md and failure-handling.md for full topology and
 ACK/NACK details.
+
+
+## Phase 5 -- Atomic Job Claiming (Concurrency Safety)
+
+The worker no longer uses a SELECT-then-UPDATE pattern to begin
+processing. A single atomic conditional UPDATE (claimJob) is now the
+sole gatekeeper: it both decides whether a job is claimable and
+performs the state transition, in one SQL statement, relying on
+Postgres row-level locking to guarantee at most one caller can win a
+race for the same row.
+
+claimJob's WHERE clause allows claiming a job in QUEUED or RETRYING
+status (normal/retry entry points), and additionally allows reclaiming
+a job stuck in PROCESSING if it has been in that state longer than
+STALE_PROCESSING_THRESHOLD_SECONDS (60s) -- treating it as orphaned
+(worker likely crashed) rather than actively held. Without this, a
+worker crash between claim and terminal write would permanently orphan
+the job, since ordinary redelivery would otherwise never match a
+PROCESSING-only exclusion.
+
+Verified under a genuine two-process concurrent race (see
+development-log.md, Phase 5 Test 4): both workers' claim attempts
+landed within 1ms of each other; the losing claim's rejection reason
+(currentStatus=PROCESSING, not a stale terminal state) directly
+evidenced real contention at the database layer, not a sequential
+near-miss.
+
+See database.md, engineering-decisions.md, and failure-handling.md for
+full detail.

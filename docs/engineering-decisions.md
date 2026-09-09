@@ -244,3 +244,49 @@ worker-internal). The non-retryable test hook
 (payload.shouldFailPermanently) already provides a fast way to exercise
 the DLQ path without waiting, making this addition non-essential right
 now.
+
+
+## Correction: CLAIM_TEST_DELAY_MS replaced with CLAIM_TEST_SYNC_EPOCH_MS before execution
+
+**Context:** Pre-execution review of the Test 4 concurrency-race
+procedure found that a fixed relative delay (applied independently per
+message, from each message's own arrival time) does not guarantee two
+independent worker processes' claim attempts land close enough in time
+to constitute a genuine race -- if the two messages are delivered even
+a few seconds apart (realistic given manual test setup via the RabbitMQ
+UI), the delay only guarantees sequential-but-nearby claims, not
+overlapping ones.
+
+**Chosen approach:** Replaced with an absolute shared target timestamp
+(CLAIM_TEST_SYNC_EPOCH_MS). Both worker processes sleep until the same
+wall-clock instant before attempting their claim, regardless of when
+each actually received its message -- converging both attempts to
+within milliseconds of each other at the point they call claimJob(),
+which is genuine evidence of contention at the database layer, not
+merely temporal proximity in application logs.
+
+**Why:** This is the smallest change that closes the determinism gap
+without touching claimJob() or any production correctness code -- it
+is purely a test-harness mechanism.
+
+**Trade-off:** Requires computing and manually distributing a shared
+timestamp value across terminals for the test, slightly more setup than
+a single relative delay. Accepted, since correctness of the evidence
+matters more than test-setup convenience.
+
+## Correction: Test 3 reframed -- prefetch(1) prevents a single-worker "duplicate while PROCESSING" test
+
+**Context:** The original Test 3 (single worker, duplicate published
+while the first message is mid-delay) does not actually exercise a
+concurrent PROCESSING-state race. With prefetch(1) and one consumer,
+RabbitMQ will not deliver a second message to that consumer until the
+first is acknowledged -- so by the time the duplicate is delivered, the
+original job has already reached a terminal state (COMPLETED). Test 3
+was silently testing terminal-exclusion, not a live race.
+
+**Resolution:** Test 3 is reframed honestly as "duplicate delivery
+after the job is already COMPLETED" -- a legitimate, useful, but
+different guarantee. Genuinely testing a duplicate against an actively
+PROCESSING (not yet terminal) job requires >= 2 concurrent consumers,
+which only Test 4 provides. Test 4 is now the sole test responsible for
+proving the core concurrency-race guarantee.

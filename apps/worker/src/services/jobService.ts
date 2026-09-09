@@ -1,4 +1,5 @@
 import { pool } from "../db/pool";
+import { STALE_PROCESSING_THRESHOLD_SECONDS } from "../retry/claimPolicy";
 
 export interface Job {
   id: string;
@@ -17,19 +18,39 @@ export async function getJobById(id: string): Promise<Job | null> {
   return result.rows[0] ?? null;
 }
 
-export async function markProcessing(id: string): Promise<Job> {
+// Phase 5: Atomic conditional claim. This is the SOLE gatekeeper into
+// processing -- the status check and the state transition happen in ONE
+// SQL statement. Postgres row-level locking under READ COMMITTED (the
+// default) guarantees that when two callers race to claim the same row,
+// only one can successfully match the WHERE clause and receive a row;
+// the other necessarily evaluates against the already-updated row and
+// matches zero rows.
+//
+// The WHERE clause also allows reclaiming a job stuck in PROCESSING if
+// its updated_at is older than STALE_PROCESSING_THRESHOLD_SECONDS --
+// without this, a worker crash between claim and terminal write would
+// permanently orphan the job, since ordinary redelivery would otherwise
+// never match (status is PROCESSING, not QUEUED/RETRYING).
+//
+// Returns the claimed Job (attempt_count already incremented) if this
+// call won the claim, or null if not claimable: already terminal,
+// actively PROCESSING elsewhere (recent updated_at), does not exist, or
+// this call lost a race against a concurrent claim attempt.
+export async function claimJob(id: string): Promise<Job | null> {
   const result = await pool.query<Job>(
     `UPDATE jobs
      SET status = 'PROCESSING',
          attempt_count = attempt_count + 1,
          updated_at = now()
      WHERE id = $1
+       AND (
+         status IN ('QUEUED', 'RETRYING')
+         OR (status = 'PROCESSING' AND updated_at < now() - ($2 * interval '1 second'))
+       )
      RETURNING *`,
-    [id]
+    [id, STALE_PROCESSING_THRESHOLD_SECONDS]
   );
-  const job = result.rows[0];
-  if (!job) throw new Error(`markProcessing: job ${id} not found`);
-  return job;
+  return result.rows[0] ?? null;
 }
 
 export async function markCompleted(id: string): Promise<Job> {
@@ -39,17 +60,21 @@ export async function markCompleted(id: string): Promise<Job> {
          last_error = NULL,
          updated_at = now()
      WHERE id = $1
+       AND status = 'PROCESSING'
      RETURNING *`,
     [id]
   );
   const job = result.rows[0];
-  if (!job) throw new Error(`markCompleted: job ${id} not found`);
+  // Defense-in-depth only: the sole caller is the worker that just
+  // atomically claimed this job via claimJob(), so status should
+  // always be PROCESSING here. A throw here indicates an unexpected
+  // code path, not a normal race outcome.
+  if (!job) throw new Error(`markCompleted: job ${id} not found or not in PROCESSING state`);
   return job;
 }
 
-// Retained from Phase 3 for backward compatibility / potential direct use.
-// As of Phase 4 the consumer no longer calls this — failures now resolve
-// to either markRetrying or markDeadLettered. See engineering-decisions.md.
+// Retained from Phase 3/4 for backward compatibility. Not called by the
+// consumer (superseded by markRetrying/markDeadLettered).
 export async function markFailed(id: string, errorMessage: string): Promise<Job> {
   const result = await pool.query<Job>(
     `UPDATE jobs
@@ -72,11 +97,12 @@ export async function markRetrying(id: string, errorMessage: string): Promise<Jo
          last_error = $2,
          updated_at = now()
      WHERE id = $1
+       AND status = 'PROCESSING'
      RETURNING *`,
     [id, errorMessage]
   );
   const job = result.rows[0];
-  if (!job) throw new Error(`markRetrying: job ${id} not found`);
+  if (!job) throw new Error(`markRetrying: job ${id} not found or not in PROCESSING state`);
   return job;
 }
 
@@ -87,10 +113,11 @@ export async function markDeadLettered(id: string, errorMessage: string): Promis
          last_error = $2,
          updated_at = now()
      WHERE id = $1
+       AND status = 'PROCESSING'
      RETURNING *`,
     [id, errorMessage]
   );
   const job = result.rows[0];
-  if (!job) throw new Error(`markDeadLettered: job ${id} not found`);
+  if (!job) throw new Error(`markDeadLettered: job ${id} not found or not in PROCESSING state`);
   return job;
 }

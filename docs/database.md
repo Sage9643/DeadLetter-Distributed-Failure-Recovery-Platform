@@ -95,3 +95,28 @@ write an invalid status.
   configurable per-job via the API (deliberately deferred -- see
   engineering-decisions.md).
 
+
+## Phase 5 update -- atomic claim query
+
+claimJob() (replaces Phase 3/4's markProcessing):
+
+```sql
+UPDATE jobs
+SET status = 'PROCESSING', attempt_count = attempt_count + 1, updated_at = now()
+WHERE id = $1
+  AND (
+    status IN ('QUEUED', 'RETRYING')
+    OR (status = 'PROCESSING' AND updated_at < now() - ($2 * interval '1 second'))
+  )
+RETURNING *
+```
+
+No new index required: the query is located via the existing primary
+key index on id; the status/staleness condition is evaluated against
+that single row, not used as a separate index scan predicate.
+
+markCompleted/markRetrying/markDeadLettered now include
+`AND status = 'PROCESSING'` as a defense-in-depth precondition. Not the
+primary correctness mechanism (claimJob's atomicity is) -- protects
+against any future code path calling these out of the expected order.
+

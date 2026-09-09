@@ -746,3 +746,138 @@ worker process.
 - RabbitMQ's management UI Features column (D/DLX/DLK) provides a
   broker-side confirmation of queue configuration independent of our
   own code, useful as a second source of truth when verifying topology
+
+
+## Phase 5 -- Pre-execution test-design review
+
+**Date:** 2026-09-09
+
+Before running any tests, reviewed the concurrency-test procedure
+specifically for determinism. Found the originally planned
+CLAIM_TEST_DELAY_MS (fixed relative delay) insufficient to guarantee a
+genuine race between two independent worker processes, and found the
+originally planned Test 3 did not actually exercise the scenario its
+name implied, due to prefetch(1) serializing delivery to a single
+consumer. Both issues fixed before execution -- see
+engineering-decisions.md for full detail. claimJob() and jobService.ts
+are unchanged; only consumer.ts's test hook and env.ts were revised.
+
+No tests have been executed yet. Results remain pending.
+
+
+## Phase 5 -- Incident found and fixed during testing
+
+**Date:** 2026-09-09
+
+While setting up Test 3, an accidental malformed jobId (placeholder
+text left in a manually-published RabbitMQ message) triggered a real
+infinite redelivery loop. Diagnosed, fixed, and verified -- full detail
+in incidents-and-failures.md, Incident 4. consumer.ts's claim catch
+block now distinguishes Postgres invalid-UUID errors (22P02, ack +
+discard) from genuine infrastructure errors (nack + requeue, unchanged).
+
+
+## Phase 5 -- Real Test Results
+
+**Date:** 2026-09-09
+
+All tests run against real Postgres/RabbitMQ containers and real
+worker process(es), not simulated.
+
+1. **Test 1 (normal success):** jobId 47bf7c31-ff6f-43b8-a2f0-5c2c7942ee27.
+   Worker log confirmed full claimJob-based flow: Attempting atomic
+   claim -> Claimed job, marked PROCESSING (attempt 1) -> Executing
+   processJob() -> Job completed successfully. DB confirmed COMPLETED,
+   attempt_count=1.
+
+2. **Test 2 (retry/backoff/DLQ, unchanged from Phase 4):**
+   jobId b5d9b711-0b4c-4e33-81eb-1b90e1b4dbaa. Measured actual gaps
+   between failure and next claim against calculated exponential
+   backoff: attempt 1->2 scheduled 2000ms/actual 2008ms; 2->3 scheduled
+   4000ms/actual 4004ms; 3->4 scheduled 8000ms/actual 8005ms; 4->5
+   scheduled 16000ms/actual 16009ms. All within ~10ms of calculated
+   values -- confirms the claimJob rewrite did not alter retry timing.
+   Attempt 5 correctly exhausted -> DEAD_LETTERED. DB confirmed
+   DEAD_LETTERED, attempt_count=5.
+
+3. **Incident found and fixed during setup (see incidents-and-failures.md,
+   Incident 4):** an accidentally malformed jobId (leftover placeholder
+   text in a manually-published message) triggered a genuine infinite
+   redelivery loop, confirmed via RabbitMQ UI showing sustained ~31
+   deliveries/sec. Root cause: claimJob's catch block treated all
+   thrown errors as transient infra failures and unconditionally
+   requeued. Fixed by detecting Postgres error code 22P02
+   (invalid_text_representation) and acking-and-discarding instead.
+   Verified fixed by deliberately reproducing with a known-invalid
+   jobId: exactly one log line, zero redelivery loop, queue settled
+   to Ready=0/Unacked=0/Total=0.
+
+4. **Test 3 (duplicate delivery after COMPLETED, reframed per
+   pre-execution review):** jobId 8b2523f6-60f4-4e02-a8fe-954776ca5571.
+   Original delivery completed normally. Manually republished duplicate
+   72 seconds later: worker logged "Claim failed -- job not in
+   claimable state" with currentStatus=COMPLETED, correctly ACKed
+   without reprocessing. DB confirmed unchanged: COMPLETED,
+   attempt_count=1.
+
+5. **Test 4 (genuine concurrent claim race -- the critical test):**
+   jobId c67e22d7-e8eb-42a0-bf81-c4c82de58921. Two independent worker
+   processes (pids 3592 and 160/verified distinct) synchronized via
+   CLAIM_TEST_SYNC_EPOCH_MS to the same absolute wall-clock target
+   after an initial attempt revealed the target had already elapsed by
+   the time manual test steps were completed (~90s buffer insufficient
+   for manual UI steps; retried with 180s buffer, confirmed both
+   workers logged "Sleeping until synchronized claim-test target time"
+   with correct matching target before the race).
+   Both workers' "Attempting atomic claim" fired within 1ms of each
+   other (372297 vs 372298, raw epoch ms). The losing worker's claim
+   failure reported currentStatus=PROCESSING (not a stale terminal
+   status), directly evidencing genuine contention for the row at the
+   moment of the race, not a sequential near-miss. Exactly one worker
+   logged "Executing processJob()" and completed; the other was
+   correctly ACKed without processing. DB confirmed the critical
+   assertion: COMPLETED, attempt_count=1 (not 2).
+
+6. **Test 5 (stale-PROCESSING reclaim):** jobId
+   a2df0f1a-426a-4b43-9cd4-788b8c581b22. Actual sequence differed from
+   the originally planned "simulate a mid-flight crash" scenario: the
+   worker auto-claimed and completed the job (attempt 1) before the
+   manual backdating UPDATE could be run by hand. The UPDATE then
+   forcibly overwrote the already-COMPLETED row's status back to
+   PROCESSING with a 90s-stale updated_at. A subsequently republished
+   duplicate correctly matched the staleness-reclaim branch (the
+   mechanism evaluates only current row state, not history) and
+   reclaimed it, incrementing attempt_count 1->2 and completing again.
+   This still validly demonstrates the staleness-reclaim mechanism
+   functioning correctly on a genuinely stale-PROCESSING row, though
+   the path by which that row reached that state differed from the
+   original test plan. Documented honestly rather than re-run to force
+   the originally intended narrative.
+
+### What remains to be tested
+- A "clean" version of Test 5 where the target job is deliberately slow
+  (e.g. via a test-only processing delay) so the backdate UPDATE lands
+  while the job is still genuinely mid-flight, rather than after
+  natural completion -- not performed; current evidence is considered
+  sufficient given the mechanism is provably state-based, not
+  history-based
+- Sustained DB/publish outage during retry-scheduling causing
+  NACK+requeue hot-loop -- not yet observed, tracked as a known
+  limitation carried from Phase 4
+
+### New risks introduced
+- None beyond what's tracked; Incident 4 was found and fixed within
+  this phase, not left open
+
+### What we learned
+- Manual timing-based test coordination (the original relative-delay
+  approach) is unreliable for proving genuine concurrency; an absolute
+  shared target timestamp, verified via explicit "sleeping until target"
+  log lines before trusting any race result, is necessary
+- A real bug (Incident 4) was found specifically because testing was
+  performed with real infrastructure and real manual interaction, not
+  code review alone -- direct validation of the project's testing
+  philosophy
+- The losing side's rejection reason (currentStatus at time of failure)
+  is meaningful diagnostic evidence for whether a race was genuine
+  (PROCESSING) versus sequential-after-the-fact (a terminal status)
