@@ -69,3 +69,48 @@ violated by a future change.
 correctly here — it's not a nuisance to silence, it's forcing an
 explicit decision about what happens in a case the code was implicitly
 assuming away.
+
+
+## Incident 3 — verbatimModuleSyntax error in worker, but code ran anyway
+
+**Date:** 2026-09-09
+
+**Expected behavior:** `npx tsc` in `apps/worker` compiles cleanly,
+matching the fix already applied to `apps/api` in Incident 1.
+
+**Actual behavior:** 15 TypeScript errors (TS1295, TS1287, TS1484),
+identical in nature to Incident 1 — but `node dist/queue/test-manual.js`
+ran successfully immediately afterward, despite the reported errors.
+
+**How it was reproduced:** Ran `npx tsc` in `apps/worker` after creating
+`env.ts`, `connection.ts`, and `test-manual.ts` with standard
+import/export syntax.
+
+**Root cause:** Two separate issues:
+1. The worker's `tsconfig.json` was scaffolded in Phase 0, before
+   Incident 1 (in Phase 1) revealed the `module`/`verbatimModuleSyntax`
+   contradiction for CommonJS projects. The fix was applied to the API's
+   config at the time but never retroactively applied to the worker's,
+   since the worker had no TypeScript files using import/export yet at
+   that point.
+2. Neither app's `tsconfig.json` had `noEmitOnError` set, so TypeScript's
+   default behavior (emit JavaScript output even when errors are
+   reported) meant the broken compile still produced a runnable
+   `dist/queue/test-manual.js`, masking the fact that the build was
+   actually broken.
+
+**Fix:**
+- Applied the same fix as Incident 1 to `apps/worker/tsconfig.json`:
+  `module: "commonjs"`, `verbatimModuleSyntax: false`,
+  `esModuleInterop: true`
+- Added `noEmitOnError: true` to **both** `apps/api/tsconfig.json` and
+  `apps/worker/tsconfig.json`, so a broken compile can no longer
+  silently produce output in either app
+
+**Verification:** `npx tsc` in both `apps/api` and `apps/worker` now
+completes with zero errors and zero output.
+
+**Engineering lesson:** A script exiting successfully or running
+without a runtime crash is not proof the build was actually correct —
+`tsc` reporting compile errors while still emitting usable output is a
+real gap that could hide broken code. `noEmitOnError`

@@ -422,3 +422,50 @@ worker (next step) has real messages to consume against.
 ### What we learned
 - Publishing synchronously inside the request path has a measurable
   latency cost — a real, observed trade-off, not a theoretical one
+
+
+## Phase 2 — Worker Scaffolding, Connection Module, and Build Safety Fix
+
+**Date:** 2026-09-09
+
+### What we built
+- Worker environment config (`src/config/env.ts`), mirroring the API's
+  pattern (no `PORT`, since the worker isn't an HTTP server)
+- Worker RabbitMQ connection module (`src/queue/connection.ts`), same
+  topology constants as the API
+- Verified the worker can independently connect and confirm the
+  already-existing topology (idempotent declaration, exercised from a
+  second real process)
+- Added `noEmitOnError: true` to both `apps/api` and `apps/worker`
+  tsconfig files
+
+### Why
+Prove the worker can connect using its own independent config/connection
+code before writing consumer logic on top of it.
+
+### Problems encountered
+- See `incidents-and-failures.md`, Incident 3 — same
+  `verbatimModuleSyntax` issue as Incident 1, not caught earlier because
+  the worker had no import/export code until now; additionally revealed
+  that `tsc` was silently emitting output despite reported errors in
+  both apps, now fixed with `noEmitOnError`
+
+### Tests performed
+- `npx tsc` in `apps/worker` — 15 errors on first run, 0 after fix
+- `npx tsc` in `apps/api` — confirmed still 0 errors after adding
+  `noEmitOnError` (regression check on an already-working app)
+- `node dist/queue/test-manual.js` in worker — confirmed real
+  connection to RabbitMQ succeeds and topology is confirmed idempotently
+  from a second process
+
+### What remains to be tested
+- Actual message consumption (next step)
+
+### New risks introduced
+- None; this closes a risk (silent broken builds) rather than opening
+  one
+
+### What we learned
+- `noEmitOnError` should probably be a default we set immediately when
+  scaffolding any future workspace member, rather than discovered
+  reactively
