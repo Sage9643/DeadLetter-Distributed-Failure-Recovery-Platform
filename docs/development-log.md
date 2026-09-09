@@ -469,3 +469,51 @@ code before writing consumer logic on top of it.
 - `noEmitOnError` should probably be a default we set immediately when
   scaffolding any future workspace member, rather than discovered
   reactively
+
+
+## Phase 2 — Consumer Built and Verified End-to-End
+
+**Date:** 2026-09-09
+
+### What we built
+- `src/consumer.ts` — connects to `deadletter.jobs.queue`, sets
+  `prefetch(1)`, consumes with manual ACK (`noAck: false`), parses
+  message JSON, logs, acknowledges
+- `src/index.ts` updated to start the consumer as a long-running process
+
+### Why
+Close the loop on the basic messaging path: prove a message published
+by the API is actually received and acknowledged by an independent
+worker process.
+
+### Tests performed
+- Started the worker with two real messages already waiting in the
+  queue (one manual test publish, one from an actual `POST /api/jobs`
+  HTTP request made earlier in this phase)
+- Confirmed both messages were received in order, correctly parsed
+  (jobId matched exactly what was published), and acknowledged
+- Confirmed via RabbitMQ management UI: Ready and Unacked both dropped
+  from 2/0 to 0/0 immediately upon worker connection; delivery graph
+  showed the "Deliver (manual ack)" spike matching our consume mode
+
+### What remains to be tested
+- Multiple workers running simultaneously (competing consumers)
+- Worker crashing before ACK (should trigger redelivery)
+- RabbitMQ becoming unavailable mid-publish (the tracked DB/RabbitMQ
+  consistency problem)
+- Worker actually updating job status in Postgres (Phase 3 — currently
+  the worker only logs, doesn't touch the database)
+
+### New risks introduced
+- None beyond what's already tracked; consumer currently always ACKs
+  unconditionally regardless of whether real processing would have
+  succeeded — acceptable for this phase's scope (proving delivery),
+  will become a real gap once Phase 3 adds actual processing logic
+  that can fail
+
+### What we learned
+- The full API → Postgres → RabbitMQ → Worker path is genuinely
+  working, not just individually-tested pieces assumed to compose
+  correctly — confirmed by watching two independently-created real
+  messages (different origins, different times) both get consumed
+  correctly by a process started well after they were published

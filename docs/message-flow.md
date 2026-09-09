@@ -37,3 +37,28 @@ step is needed, unlike the SQL schema.
   management UI (not just assumed from code running without error):
   exchange type `direct`/durable, queue type `classic`/durable, binding
   present with correct routing key
+
+
+## Verified (Phase 2, consumer step)
+
+- Worker successfully connects independently, confirms existing
+  topology (idempotent declaration from a second process)
+- `channel.prefetch(1)` set — worker receives at most 1 unacknowledged
+  message at a time
+- Manual ACK mode (`noAck: false`) — worker explicitly acknowledges
+  each message after processing
+- Full pipeline proven end-to-end: two real messages (one from an
+  isolated manual publish, one from an actual `POST /api/jobs` HTTP
+  request) both sat in the queue with 0 consumers, then were both
+  correctly received, parsed, and acknowledged the instant the worker
+  connected — confirmed via worker logs (jobId matched exactly) and
+  RabbitMQ UI (Ready/Unacked both dropped to 0)
+
+## Not yet handled (deliberately deferred)
+
+- Worker does not yet update job status in Postgres (still QUEUED
+  forever from the DB's perspective) — Phase 3
+- No retry/NACK logic — worker always ACKs unconditionally — Phase 4
+- No idempotency protection against duplicate delivery — Phase 5
+- DB write succeeding while RabbitMQ publish fails — not yet
+  deliberately reproduced (next planned test)
