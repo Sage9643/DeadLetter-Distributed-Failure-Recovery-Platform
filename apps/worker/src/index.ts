@@ -1,9 +1,10 @@
 import { env } from "./config/env";
 import { startConsumer } from "./consumer";
+import { logger } from "./logger";
 
-console.log("Environment loaded:", { NODE_ENV: env.NODE_ENV });
+logger.info({ NODE_ENV: env.NODE_ENV }, "Environment loaded");
 
 startConsumer().catch((err) => {
-  console.error("Worker failed to start:", err);
+  logger.error({ err }, "Worker failed to start");
   process.exit(1);
 });

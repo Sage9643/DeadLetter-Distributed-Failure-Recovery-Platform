@@ -72,3 +72,11 @@ write an invalid status.
 
 &#x20; explicit updates are simpler to reason about at this stage
 
+
+## Phase 3 update
+
+- attempt_count incremented every time a job transitions to PROCESSING.
+  max_attempts is NOT yet enforced anywhere (Phase 4).
+- last_error populated on FAILED, cleared (NULL) on COMPLETED.
+- updated_at now explicitly set by the worker on every status transition.
+

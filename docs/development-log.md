@@ -580,3 +580,78 @@ specific setup (durable queue + persistent messages + manual ACK mode).
   twice" — both are real, and Phase 5's idempotency work directly
   addresses the second one, now backed by a concrete observed scenario
   rather than an abstract concern
+
+  
+## Phase 3 -- Worker Processing Implementation
+
+**Date:** 2026-09-09
+
+### What we built
+- Worker DB pool (structured logger for pool errors, no circular
+  dependency -- logger.ts depends only on config/env.ts), job service
+  (markProcessing/markCompleted/markFailed), stub job processor with
+  deterministic failure hook (payload.shouldFail)
+- Consumer rewritten to drive the full QUEUED -> PROCESSING ->
+  COMPLETED|FAILED lifecycle, with ACK/NACK strategy split by failure
+  class (see engineering-decisions.md)
+- New docs/failure-handling.md
+
+### Why
+Worker now does real work against Postgres instead of only logging --
+this is the core of "DeadLetter" as a functioning system.
+
+### Dependencies / schema changes
+None -- pg/pino were already installed for the worker; using existing
+jobs table columns (attempt_count, last_error, status, updated_at).
+
+### Tests performed
+
+All tests run against the real Postgres/RabbitMQ containers and real
+worker process, not simulated.
+
+1. **Success path**: `POST /api/jobs` with `type: phase3_success_test`,
+   empty payload. Worker log showed `Marking job as PROCESSING` ->
+   `Job completed successfully`. DB confirmed: status=COMPLETED,
+   attempt_count=1, last_error=NULL (jobId c233ef82-f347-49c3-b68b-510fdc6f9b24).
+
+2. **Failure path**: `POST /api/jobs` with `type: phase3_failure_test`,
+   `payload.shouldFail=true`. Worker log showed `Marking job as
+   PROCESSING` -> `Job processing failed, marked as FAILED` (warn
+   level). DB confirmed: status=FAILED, attempt_count=1,
+   last_error="Simulated failure for job type \"phase3_failure_test\""
+   (jobId 0747e2ae-dd83-4a91-a8ae-1ba81655c56d).
+
+3. **RabbitMQ queue state**: confirmed via management UI after both
+   tests: Ready=0, Unacked=0, Total=0 -- both messages fully consumed
+   and acknowledged, nothing stuck in-flight.
+
+4. **Terminal-state guard**: manually re-published a message
+   (`{"jobId":"c233ef82-..."}`) for the already-COMPLETED job directly
+   via the RabbitMQ management UI (simulating redelivery). Worker
+   logged `Job already in terminal state, skipping (likely
+   redelivery), acknowledging` (warn level) and ACKed without
+   reprocessing. Confirmed via DB query: attempt_count remained 1
+   (not incremented to 2), proving markProcessing was never called
+   for the redelivered message.
+
+5. **Build**: `npm run dev` (which runs `tsc && node dist/index.js`)
+   succeeded end-to-end for all above tests; since `noEmitOnError:
+   true` is set in tsconfig, a failed compile would have blocked
+   execution entirely -- the worker running confirms a clean compile.
+
+### What remains to be tested
+- Concurrent workers racing on the same redelivered message (the
+  terminal-state guard's known gap -- Phase 5 territory, not expected
+  to be safe yet)
+- Retry/backoff/DLQ behavior -- Phase 4
+- Sustained DB outage causing NACK+requeue hot-loop -- not yet
+  observed, tracked as a known limitation
+
+### New risks introduced
+- None beyond what's already tracked in failure-handling.md
+
+### What we learned
+- The terminal-state guard, though simple, verifiably prevents the
+  exact redelivery-reprocessing scenario demonstrated in Phase 2 --
+  confirmed by both a log line and unchanged attempt_count, not
+  assumed from reading the code

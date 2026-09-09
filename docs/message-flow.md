@@ -86,3 +86,19 @@ across competing consumers, each with `prefetch(1)`. This confirms the
 architecture works with zero code changes — running more worker
 processes is the entire scaling mechanism, no code awareness of "how
 many workers exist" is needed anywhere.
+
+
+## Phase 3 update -- ACK/NACK strategy
+
+- Message ACKed only after the job's terminal DB status is successfully
+  written -- not on receipt.
+- DB error while fetching/marking PROCESSING (infra failure) -> NACK with
+  requeue=true. No backoff yet (Phase 4 concern).
+- processJob() throwing (business-logic failure) -> recorded as FAILED,
+  then ACKed -- not requeued, since no retry policy exists yet.
+- Malformed messages / unknown job ids -> ACKed and discarded.
+- Lightweight terminal-state guard (skip if already COMPLETED/FAILED)
+  prevents redundant reprocessing on redelivery -- NOT full idempotency,
+  no locking against concurrent processing. See failure-handling.md.
+- RabbitMQ continues to provide at-least-once delivery only. Exactly-once
+  processing is never guaranteed by this system.

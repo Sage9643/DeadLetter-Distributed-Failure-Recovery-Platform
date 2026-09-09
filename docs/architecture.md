@@ -66,3 +66,20 @@ See `infra/docker-compose.yml` for service definitions.
 Both services have Docker healthchecks defined so that dependent services
 (API, worker — added in later phases) can wait for actual readiness rather
 than just container start.
+
+
+## Phase 3 -- Worker Processing (Job Lifecycle)
+
+The worker now drives the real job lifecycle instead of only logging/ACKing:
+
+1. Re-fetches the job from Postgres by id (source of truth, per Phase 2)
+2. If missing or already COMPLETED/FAILED, ACKs and skips (redelivery guard,
+   NOT full idempotency -- see failure-handling.md)
+3. Marks job PROCESSING (increments attempt_count)
+4. Runs processJob() -- currently a stub; throws if payload.shouldFail === true
+5. Marks job COMPLETED or FAILED (last_error set on failure)
+6. ACKs the message (see message-flow.md and failure-handling.md for the
+   full ACK/NACK decision table)
+
+Full lifecycle now enforced: QUEUED -> PROCESSING -> COMPLETED | FAILED.
+No retry/backoff/DLQ yet -- FAILED is currently terminal (Phase 4).

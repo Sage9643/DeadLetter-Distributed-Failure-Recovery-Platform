@@ -111,3 +111,55 @@ doing regardless):** centralized error-handling middleware in Express,
 so unhandled errors return clean JSON responses instead of leaking raw
 stack traces — this is a real bug independent of which consistency
 strategy we eventually choose.
+
+
+## Decision: ACK only after terminal DB write, not on message receipt
+
+**Context:** When should the worker tell RabbitMQ a message is handled?
+
+**Options considered:** (1) ACK immediately on receipt, (2) ACK after the
+terminal status (COMPLETED/FAILED) is written to Postgres.
+
+**Chosen approach:** Option 2.
+
+**Why:** ACKing on receipt would mean a worker crash between receipt and
+finishing the DB write loses no message from RabbitMQ's perspective, but
+the job would be stuck at whatever status it was left in, with no
+mechanism to notice. ACKing after the terminal write ties message removal
+to actual completion of work, matching Postgres as source of truth.
+
+**Trade-offs:** A crash after the terminal write but before ACK causes
+redelivery of an already-completed job -- handled by the terminal-state
+guard, which is explicitly NOT full idempotency (see failure-handling.md).
+
+## Decision: Split ACK/NACK behavior by failure class
+
+**Context:** Not all failures during message handling are the same kind.
+
+**Chosen approach:** Infrastructure failures (DB unreachable while
+fetching/marking PROCESSING) -> NACK + requeue, since nothing was
+recorded and retry is safe. Business-logic failures (processJob throws)
+-> record as FAILED in Postgres, then ACK, since FAILED is currently
+terminal with no retry policy (Phase 4).
+
+**Why:** Treating both the same would either lose track of infra hiccups
+(if always ACKed) or infinitely redeliver permanently-failed jobs with no
+DLQ to catch them (if always NACKed).
+
+**Trade-offs:** NACK+requeue on DB errors has no backoff yet -- could
+hot-loop under a sustained DB outage. Accepted as a known limitation
+until Phase 4.
+
+## Decision: Worker pool error handler uses structured logger, not console.error
+
+**Context:** apps/api's pool.ts used console.error for pool-level errors.
+Worker now has a real pino logger (previously installed, unused).
+
+**Chosen approach:** apps/worker/src/logger.ts has no dependency on
+db/pool.ts (it only imports config/env.ts). pool.ts imports logger.ts.
+This one-directional dependency avoids any circular import while letting
+pool.ts log through the same structured logger as the rest of the worker.
+
+**Why:** Consistent structured logging across the whole worker process,
+not just inside the consumer -- matters once logs need to be
+correlated/searched together.
