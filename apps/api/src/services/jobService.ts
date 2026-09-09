@@ -1,5 +1,6 @@
 import { pool } from "../db/pool";
 import { CreateJobInput } from "../validation/jobSchema";
+import { publishJobCreated } from "../queue/publisher";
 
 export interface Job {
   id: string;
@@ -25,6 +26,8 @@ export async function createJob(input: CreateJobInput): Promise<Job> {
   if (!job) {
     throw new Error("Failed to create job: no row returned from INSERT");
   }
+
+  await publishJobCreated(job.id);
 
   return job;
 }

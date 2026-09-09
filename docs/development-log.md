@@ -372,3 +372,53 @@ declared in code, before writing any publish logic on top of it.
   of its API) avoided writing code against an outdated type name
 - RabbitMQ's management UI is a genuinely useful verification tool —
   confirms real broker state, not just "the script didn't throw"
+
+
+## Phase 2 — Publisher Wired Into Job Creation
+
+**Date:** 2026-09-09
+
+### What we built
+- `src/queue/publisher.ts` — `publishJobCreated(jobId)`, publishes a
+  thin `{ jobId }` message to `deadletter.jobs.exchange` with routing
+  key `job.created`, marked `persistent: true`
+- Wired into `jobService.createJob` — every real job creation now
+  publishes a message after the DB insert succeeds
+
+### Why
+Complete the basic API → Postgres → RabbitMQ path end-to-end, so the
+worker (next step) has real messages to consume against.
+
+### Tests performed
+- Manual isolated test: published a message directly, confirmed via
+  RabbitMQ UI (Ready: 1, Persistent: 1)
+- Real end-to-end test via `POST /api/jobs`: created a real job via
+  HTTP, confirmed message appeared in queue (Ready: 2, Persistent: 2),
+  matching the two independent publishes (one manual, one via the real
+  API flow)
+
+### Observations
+- `POST /api/jobs` response time increased from ~10-40ms (Phase 1,
+  DB-only) to ~167ms with the RabbitMQ publish now happening
+  synchronously in the request path. Not addressed yet — noting it as
+  a real, measured observation, not a problem to fix prematurely.
+  Relevant to revisit if/when this becomes a genuine bottleneck under
+  load testing (Phase 10).
+
+### What remains to be tested
+- Worker consuming these exact messages (next step) — two real
+  messages are currently sitting in the queue, deliberately left
+  unconsumed, to be picked up by the first working consumer
+- DB write succeeding but publish failing (the tracked consistency
+  problem) — still not yet deliberately reproduced
+
+### New risks introduced
+- The DB insert and RabbitMQ publish are two separate, non-atomic
+  operations in `createJob`. If the publish fails after a successful
+  insert, the job would be persisted as QUEUED with no worker ever
+  notified. Not yet handled — tracked, to be reproduced and analyzed
+  once the worker exists.
+
+### What we learned
+- Publishing synchronously inside the request path has a measurable
+  latency cost — a real, observed trade-off, not a theoretical one
