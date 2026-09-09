@@ -517,3 +517,27 @@ worker process.
   correctly — confirmed by watching two independently-created real
   messages (different origins, different times) both get consumed
   correctly by a process started well after they were published
+
+
+## Phase 2 — Competing Consumers Verified
+
+**Date:** 2026-09-09
+
+### What we tested
+Ran two worker processes simultaneously against the same queue, created
+4 jobs via real HTTP requests, observed which worker consumed each.
+
+### Result
+Clean alternation across both workers (1st→W1, 2nd→W2, 3rd→W1, 4th→W2),
+confirmed via worker terminal logs and cross-checked against jobIds
+returned by the API. RabbitMQ management UI confirmed Consumers: 2
+before the test began.
+
+### Why this matters
+Confirms horizontal scaling of workers requires zero code changes —
+"run more worker processes" is genuinely the entire mechanism, not
+something requiring additional coordination logic we'd need to build.
+
+### What remains to be tested
+- Worker crashing before ACK — should trigger redelivery (next step)
+- RabbitMQ unavailable during publish — the tracked consistency problem

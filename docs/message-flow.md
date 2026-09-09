@@ -62,3 +62,27 @@ step is needed, unlike the SQL schema.
 - No idempotency protection against duplicate delivery — Phase 5
 - DB write succeeding while RabbitMQ publish fails — not yet
   deliberately reproduced (next planned test)
+
+
+## Verified — Competing Consumers (Phase 2)
+
+Ran two independent worker processes simultaneously, both connected to
+`deadletter.jobs.queue`. Confirmed via RabbitMQ management UI:
+Consumers: 2.
+
+Created 4 jobs in quick succession via `POST /api/jobs`. Observed
+distribution:
+
+| Job (creation order) | Consumed by |
+|----------------------|-------------|
+| 1st                  | Worker #1   |
+| 2nd                  | Worker #2   |
+| 3rd                  | Worker #1   |
+| 4th                  | Worker #2   |
+
+Clean alternation — RabbitMQ's default round-robin-style distribution
+across competing consumers, each with `prefetch(1)`. This confirms the
+"Worker 1, Worker 2, Worker N" scaling model from the original
+architecture works with zero code changes — running more worker
+processes is the entire scaling mechanism, no code awareness of "how
+many workers exist" is needed anywhere.
