@@ -80,3 +80,18 @@ write an invalid status.
 - last_error populated on FAILED, cleared (NULL) on COMPLETED.
 - updated_at now explicitly set by the worker on every status transition.
 
+
+## Phase 4 update
+
+- RETRYING and DEAD_LETTERED statuses (present in the CHECK constraint
+  since the original Phase 1 migration) are now actively written by the
+  worker.
+- FAILED is retired going forward -- the worker no longer writes it.
+  Existing Phase 3 rows with status=FAILED remain unchanged (no backfill
+  migration performed).
+- attempt_count continues to increment on every PROCESSING transition,
+  regardless of how many times a job has already been retried.
+- max_attempts remains fixed at its DEFAULT 5 (Phase 1 schema); not yet
+  configurable per-job via the API (deliberately deferred -- see
+  engineering-decisions.md).
+

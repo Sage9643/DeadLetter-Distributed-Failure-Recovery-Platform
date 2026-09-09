@@ -102,3 +102,26 @@ many workers exist" is needed anywhere.
   no locking against concurrent processing. See failure-handling.md.
 - RabbitMQ continues to provide at-least-once delivery only. Exactly-once
   processing is never guaranteed by this system.
+
+
+## Phase 4 update -- retry and dead-letter topology
+
+New exchange: `deadletter.jobs.failures.exchange` (direct), worker-only
+(API never publishes here).
+
+- Routing key `job.retry` -> `deadletter.jobs.retry.queue`
+  - Queue arguments: x-dead-letter-exchange=deadletter.jobs.exchange,
+    x-dead-letter-routing-key=job.created
+  - No queue-level TTL; each message carries its own `expiration`
+    property (milliseconds) set at publish time based on calculated
+    backoff
+  - On TTL expiry, RabbitMQ automatically republishes the message to
+    deadletter.jobs.exchange with routing key job.created -- this native
+    dead-letter-exchange behavior is the entire retry/delay mechanism,
+    no plugin or custom scheduling code required
+- Routing key `job.dead_letter` -> `deadletter.jobs.dlq`
+  - Terminal; not consumed this phase
+
+RabbitMQ continues to provide at-least-once delivery only, never
+exactly-once. This applies to retry-queue redelivery as well as original
+delivery.

@@ -655,3 +655,94 @@ worker process, not simulated.
   exact redelivery-reprocessing scenario demonstrated in Phase 2 --
   confirmed by both a log line and unchanged attempt_count, not
   assumed from reading the code
+
+
+## Phase 4 -- Retry, Exponential Backoff, and Dead Letter Queue
+
+**Date:** 2026-09-09
+
+### What we built
+- New failures exchange + retry queue (TTL+DLX-based delay mechanism,
+  no plugin) + DLQ, worker-only topology
+- retryPolicy.ts (exponential backoff, pure function)
+- NonRetryableError for retryable/terminal classification
+- jobService: markRetrying, markDeadLettered added; markFailed retained
+  but no longer called by the consumer
+- jobProcessor: shouldFailPermanently test hook added alongside existing
+  shouldFail
+- consumer.ts: full retry/DLQ orchestration, updated terminal-state
+  guard (RETRYING excluded, DEAD_LETTERED and FAILED included)
+
+### Why
+Completes the core "DeadLetter" failure-handling story: a failure is
+never simply a dead end -- it's either retried with backoff or
+explicitly, observably dead-lettered.
+
+### Database / dependency changes
+None -- schema already supported RETRYING/DEAD_LETTERED since Phase 1;
+no new packages or env vars.
+
+### Tests performed
+
+All tests run against real Postgres/RabbitMQ containers and the real
+worker process.
+
+1. **Test A — non-retryable failure (NonRetryableError path)**:
+   `POST /api/jobs` with `type: phase4_nonretryable_test`,
+   `payload.shouldFailPermanently=true`. Worker log showed
+   `Marked job as PROCESSING` (attempt 1) -> `Job failed permanently,
+   sent to DLQ` (reason: non-retryable), immediately, no retry attempted.
+   DB confirmed: status=DEAD_LETTERED, attempt_count=1
+   (jobId cf051023-8001-4a91-ae6a-9c2c8ec51215). RabbitMQ UI confirmed
+   deadletter.jobs.dlq: Ready=1.
+
+2. **Test B — retryable failure through full exhaustion**:
+   `POST /api/jobs` with `type: phase4_retry_test`,
+   `payload.shouldFail=true`. Worker log showed 5 full attempt cycles.
+   Measured actual gaps between failure and next attempt against the
+   calculated exponential backoff:
+   - attempt 1->2: scheduled 2000ms, actual 2011ms
+   - attempt 2->3: scheduled 4000ms, actual 4011ms
+   - attempt 3->4: scheduled 8000ms, actual 8004ms
+   - attempt 4->5: scheduled 16000ms, actual 16032ms
+   All within ~10-30ms of the calculated backoff (normal scheduling
+   overhead) -- confirms the TTL+DLX retry mechanism produces accurate,
+   real delays, not approximate ones. Attempt 5 correctly triggered
+   exhaustion (reason: attempts-exhausted) rather than another retry.
+   DB confirmed: status=DEAD_LETTERED, attempt_count=5
+   (jobId bd1c4f20-66c3-4710-9690-94d1865d8c23).
+
+3. **RabbitMQ queue state after both tests**: deadletter.jobs.dlq
+   Ready=2 (both jobs), deadletter.jobs.queue Ready=0,
+   deadletter.jobs.retry.queue Ready=0 -- confirmed via management UI,
+   all three queues checked simultaneously. Retry queue's Features
+   column independently displayed by RabbitMQ as D/DLX/DLK, confirming
+   the broker's own read of our topology declaration (durable, dead
+   letter exchange + routing key configured) matches intent.
+
+4. **Build**: `npx tsc` completed silently (zero errors) prior to
+   worker startup; `noEmitOnError` guarantees this given the worker ran
+   successfully.
+
+### What remains to be tested
+- DLQ consumption/inspection (Phase 6 -- currently DLQ messages simply
+  accumulate, unconsumed, by design this phase)
+- Concurrent workers racing on a redelivered RETRYING-status job (Phase
+  5 -- terminal-state guard's known gap, not expected to be safe yet)
+- Sustained DB/publish outage during retry-scheduling causing
+  NACK+requeue hot-loop -- not yet observed, tracked as a known
+  limitation
+
+### New risks introduced
+- None beyond what's already tracked in failure-handling.md (per-message
+  TTL expiry ordering not strictly guaranteed by RabbitMQ; NACK+requeue
+  has no backoff)
+
+### What we learned
+- The TTL+DLX pattern's timing was independently verified against wall-
+  clock timestamps, not assumed from RabbitMQ documentation -- measured
+  gaps matched calculated backoff within normal scheduling overhead
+  across all 4 retry cycles
+- RabbitMQ's management UI Features column (D/DLX/DLK) provides a
+  broker-side confirmation of queue configuration independent of our
+  own code, useful as a second source of truth when verifying topology

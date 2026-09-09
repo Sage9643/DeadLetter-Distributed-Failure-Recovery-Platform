@@ -83,3 +83,24 @@ The worker now drives the real job lifecycle instead of only logging/ACKing:
 
 Full lifecycle now enforced: QUEUED -> PROCESSING -> COMPLETED | FAILED.
 No retry/backoff/DLQ yet -- FAILED is currently terminal (Phase 4).
+
+
+## Phase 4 -- Retry, Backoff, and Dead Letter Queue
+
+On processing failure, the worker now classifies and routes the job
+instead of leaving it terminally FAILED:
+
+1. NonRetryableError thrown -> DEAD_LETTERED immediately, published to
+   deadletter.jobs.dlq
+2. Retryable error, attempts remain -> RETRYING, published to
+   deadletter.jobs.retry.queue with a per-message TTL (exponential
+   backoff). RabbitMQ dead-letters it back to the main queue on expiry.
+3. Retryable error, attempts exhausted (attempt_count >= max_attempts)
+   -> DEAD_LETTERED, published to deadletter.jobs.dlq
+
+The API is unchanged and has no awareness of retry/DLQ topology --
+retry/failure handling is entirely a worker-internal concern, preserving
+the separation of concerns established in Phase 2.
+
+See message-flow.md and failure-handling.md for full topology and
+ACK/NACK details.

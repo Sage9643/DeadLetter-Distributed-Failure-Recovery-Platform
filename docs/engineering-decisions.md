@@ -163,3 +163,84 @@ pool.ts log through the same structured logger as the rest of the worker.
 **Why:** Consistent structured logging across the whole worker process,
 not just inside the consumer -- matters once logs need to be
 correlated/searched together.
+
+
+## Decision: TTL + Dead Letter Exchange for retry delay, not the delayed-message plugin
+
+**Context:** RabbitMQ core has no built-in delayed redelivery. The
+common alternative is the `rabbitmq_delayed_message_exchange` plugin.
+
+**Options considered:** (1) enable the delayed-message plugin
+(non-default, requires image/config changes), (2) native TTL + DLX
+pattern using only default RabbitMQ capabilities.
+
+**Chosen approach:** Option 2.
+
+**Why:** Avoids adding new infrastructure/plugins per the project's
+explicit constraint against unnecessary additions. The TTL+DLX pattern
+is a well-established, native RabbitMQ technique requiring zero changes
+to the Docker image already running since Phase 0.
+
+**Trade-offs:** Per-message TTL expiry ordering is not strictly
+guaranteed by RabbitMQ when messages in the same queue have different
+TTLs (RabbitMQ only checks the queue head for expiry). Not expected to
+matter at this project's scale; documented as a known limitation rather
+than solved.
+
+## Decision: Exponential backoff formula and constants
+
+**Chosen approach:** `delayMs = min(2000 * 2^(attemptCount-1), 20000)`,
+implemented as a pure function in retryPolicy.ts.
+
+**Why:** Simple, predictable, easily testable locally (max ~30s total
+wait across all retries before exhaustion with default max_attempts=5).
+No new environment variables introduced -- constants are code, not
+config, since they don't need to vary per-environment yet.
+
+## Decision: NonRetryableError for retryable vs terminal classification
+
+**Context:** Not all processing failures should be retried -- e.g., a
+permanently invalid job type is pointless to retry 5 times with backoff.
+
+**Chosen approach:** A dedicated `NonRetryableError` class. Processors
+throw it to signal immediate dead-lettering; any other thrown error is
+treated as retryable by default.
+
+**Why:** Explicit opt-in to "don't retry" via error type is simple,
+type-checkable (`instanceof`), and doesn't require every processor to
+manage attempt-counting logic itself -- that stays centralized in the
+consumer.
+
+**Trade-offs:** Currently binary (retryable or not) -- no support yet
+for per-error-type custom backoff or retry limits. Sufficient for
+current scope.
+
+## Decision: Retire FAILED as a worker-written terminal status
+
+**Context:** Phase 3 introduced FAILED as terminal. Phase 4's entire
+purpose is ensuring a failure is never simply terminal without either a
+retry attempt or explicit dead-lettering.
+
+**Chosen approach:** The worker no longer writes FAILED. Every failure
+now resolves to RETRYING or DEAD_LETTERED. FAILED remains valid in the
+schema (existing Phase 3 rows, like the phase3_failure_test job, keep
+their historical status) and is still checked defensively in the
+terminal-state guard.
+
+**Why:** This is a genuinely required behavior change (not incidental)
+-- Phase 3's FAILED was correct for that phase's scope (no retry policy
+existed), but is superseded now that one does.
+
+## Decision: max_attempts remains fixed at schema default, not yet API-configurable
+
+**Context:** Testing DLQ-via-exhaustion requires waiting through all
+retries (~30s with defaults). A per-job override could speed this up.
+
+**Chosen approach:** Deferred. Not implemented this phase.
+
+**Why:** Adding this touches the API's validation schema and job
+creation flow, which is out of this phase's stated scope (retry/DLQ is
+worker-internal). The non-retryable test hook
+(payload.shouldFailPermanently) already provides a fast way to exercise
+the DLQ path without waiting, making this addition non-essential right
+now.
