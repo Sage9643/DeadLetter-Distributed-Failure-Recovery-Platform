@@ -321,3 +321,54 @@ real HTTP: returned `404` with `{"error":"Job not found"}`, logged
 correctly via pino-http. All three response paths for Phase 1
 (`201`, `400`, `404`) are now confirmed against the real running
 server, not just assumed from code review.
+
+
+## Phase 2 — RabbitMQ Connection Module (API side)
+
+**Date:** 2026-09-09
+
+### What we built
+- Added `RABBITMQ_URL` to environment config (`.env`, `.env.example`,
+  Zod schema in `env.ts`)
+- Installed `amqplib` (v2.0.1) and its type definitions
+- `src/queue/connection.ts` — API-side connection module declaring our
+  topology (`deadletter.jobs.exchange`, `deadletter.jobs.queue`, bound
+  with routing key `job.created`), with `getChannel()`/`closeConnection()`
+
+### Why
+Establish and prove a real connection to RabbitMQ, with topology
+declared in code, before writing any publish logic on top of it.
+
+### Problems encountered
+- None directly, but verified before assuming: `amqplib` installed at
+  v2.0.1, notably newer than expected from general knowledge. Checked
+  release notes before writing code — confirmed `amqp.connect()` now
+  returns a `ChannelModel` type (renamed from `Connection` as of
+  0.10.7+), but core method surface (`createChannel`, `assertExchange`,
+  `assertQueue`, `bindQueue`, etc.) is unchanged. No code impact beyond
+  using the correct type name.
+
+### Tests performed
+- Manual script: connected, declared topology, closed connection —
+  succeeded with no errors
+- Verified visually in RabbitMQ management UI: exchange count went
+  from 7 → 8 (our new `deadletter.jobs.exchange`, type `direct`,
+  durable), queue count went from 0 → 1 (`deadletter.jobs.queue`,
+  durable, running), and the queue's Bindings section confirmed the
+  binding from our exchange with routing key `job.created`
+
+### What remains to be tested
+- Actually publishing a message (next step)
+- Worker-side connection and consumption
+- What happens if RabbitMQ is unreachable when the API tries to connect
+
+### New risks introduced
+- None yet; connection and topology declaration only, no publish/consume
+  logic
+
+### What we learned
+- Checking a dependency's actual installed version and changelog before
+  writing code against it (rather than relying on training-data memory
+  of its API) avoided writing code against an outdated type name
+- RabbitMQ's management UI is a genuinely useful verification tool —
+  confirms real broker state, not just "the script didn't throw"
