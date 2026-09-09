@@ -114,3 +114,51 @@ completes with zero errors and zero output.
 without a runtime crash is not proof the build was actually correct —
 `tsc` reporting compile errors while still emitting usable output is a
 real gap that could hide broken code. `noEmitOnError`
+
+
+## Deliberate Test 1 — Worker crash before ACK triggers redelivery
+
+**Date:** 2026-09-09
+
+**Purpose:** Verify RabbitMQ's redelivery guarantee actually works, per
+the project's requirement to test failure behavior rather than assume
+it, before building retry/DLQ logic on top of an unverified assumption.
+
+**Setup:** Temporarily added a 15-second artificial delay to the
+worker's message handler (before the ACK call), to create an observable
+window where a message is received but not yet acknowledged.
+
+**Procedure:**
+1. Started one worker, confirmed via RabbitMQ UI: 1 consumer connected
+2. Published one job via real `POST /api/jobs` request
+   (jobId: `19903a41-45a5-4c60-89d1-7740c31e0130`)
+3. Worker received the message, logged it, entered the 15-second sleep
+4. Killed the worker process (Ctrl+C) mid-sleep, before the ACK line
+   executed — simulating an unexpected crash during processing
+
+**Observed behavior:**
+- RabbitMQ management UI immediately showed the message transition
+  from Unacked back to Ready (confirmed visually via the queue's
+  message-state graph)
+- No message was lost — Total count remained 1 throughout
+- Started a fresh worker process; it immediately received the exact
+  same message (same jobId) without any manual intervention —
+  RabbitMQ redelivered it automatically upon detecting the original
+  consumer's connection had dropped
+- The second attempt ran to completion and acknowledged normally
+
+**Conclusion:** RabbitMQ's core reliability mechanism — detecting a
+dropped consumer connection and redelivering unacknowledged messages —
+works as documented, verified by direct observation rather than
+assumed from RabbitMQ's documentation.
+
+**Engineering implication (tracked forward):** This same mechanism is
+also the direct cause of the duplicate-processing problem Phase 5 must
+address. If real processing had already produced a side effect (e.g.,
+sent an actual email) before the simulated crash, that side effect
+would not be undone — redelivery guarantees at-least-once delivery,
+not exactly-once execution. This test makes that risk concrete rather
+than theoretical, ahead of building idempotency protection.
+
+**Cleanup:** Artificial delay removed from `consumer.ts` after the
+test; confirmed clean recompile with no errors.

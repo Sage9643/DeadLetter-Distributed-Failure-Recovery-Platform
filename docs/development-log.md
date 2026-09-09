@@ -541,3 +541,42 @@ something requiring additional coordination logic we'd need to build.
 ### What remains to be tested
 - Worker crashing before ACK — should trigger redelivery (next step)
 - RabbitMQ unavailable during publish — the tracked consistency problem
+
+
+## Phase 2 — Deliberate Redelivery Test
+
+**Date:** 2026-09-09
+
+### What we tested
+Deliberately killed a worker process mid-processing (before ACK) to
+observe whether RabbitMQ actually redelivers the unacknowledged message,
+rather than assuming this behavior from documentation.
+
+### Result
+Confirmed working exactly as expected. Full details in
+`incidents-and-failures.md`, Deliberate Test 1. Message was never lost;
+automatically redelivered to a new worker upon reconnection.
+
+### Why this matters
+This is the foundational reliability guarantee the entire failure-
+handling design (Phases 4-6: retries, DLQ, replay) depends on. Verifying
+it directly, by causing and observing a real crash, is more trustworthy
+than assuming RabbitMQ's documented behavior applies correctly to our
+specific setup (durable queue + persistent messages + manual ACK mode).
+
+### What remains to be tested
+- RabbitMQ itself becoming unavailable during a publish (the tracked
+  DB/RabbitMQ consistency problem) — next test
+- Worker updating job status in Postgres (Phase 3 scope)
+
+### New risks introduced
+- None; this test confirms existing infrastructure behavior, doesn't
+  change it
+
+### What we learned
+- At-least-once delivery (what we just proved) is a different, weaker
+  guarantee than exactly-once execution. Redelivery solves "did the
+  message get lost" but actively creates "could this get processed
+  twice" — both are real, and Phase 5's idempotency work directly
+  addresses the second one, now backed by a concrete observed scenario
+  rather than an abstract concern
