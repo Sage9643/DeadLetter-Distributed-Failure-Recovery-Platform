@@ -11,6 +11,10 @@ export interface Job {
   last_error: string | null;
   created_at: string;
   updated_at: string;
+  total_attempt_count: number;
+  replay_count: number;
+  last_dead_lettered_at: string | null;
+  last_dead_letter_reason: string | null;
 }
 
 export async function getJobById(id: string): Promise<Job | null> {
@@ -18,29 +22,17 @@ export async function getJobById(id: string): Promise<Job | null> {
   return result.rows[0] ?? null;
 }
 
-// Phase 5: Atomic conditional claim. This is the SOLE gatekeeper into
-// processing -- the status check and the state transition happen in ONE
-// SQL statement. Postgres row-level locking under READ COMMITTED (the
-// default) guarantees that when two callers race to claim the same row,
-// only one can successfully match the WHERE clause and receive a row;
-// the other necessarily evaluates against the already-updated row and
-// matches zero rows.
-//
-// The WHERE clause also allows reclaiming a job stuck in PROCESSING if
-// its updated_at is older than STALE_PROCESSING_THRESHOLD_SECONDS --
-// without this, a worker crash between claim and terminal write would
-// permanently orphan the job, since ordinary redelivery would otherwise
-// never match (status is PROCESSING, not QUEUED/RETRYING).
-//
-// Returns the claimed Job (attempt_count already incremented) if this
-// call won the claim, or null if not claimable: already terminal,
-// actively PROCESSING elsewhere (recent updated_at), does not exist, or
-// this call lost a race against a concurrent claim attempt.
+// Phase 5: Atomic conditional claim (WHERE clause and locking semantics
+// UNCHANGED from Phase 5 -- see engineering-decisions.md). Phase 6 adds
+// total_attempt_count as a second increment in the SAME atomic UPDATE,
+// purely for lifetime observability; this does not alter the claim's
+// correctness guarantee in any way.
 export async function claimJob(id: string): Promise<Job | null> {
   const result = await pool.query<Job>(
     `UPDATE jobs
      SET status = 'PROCESSING',
          attempt_count = attempt_count + 1,
+         total_attempt_count = total_attempt_count + 1,
          updated_at = now()
      WHERE id = $1
        AND (
@@ -65,16 +57,12 @@ export async function markCompleted(id: string): Promise<Job> {
     [id]
   );
   const job = result.rows[0];
-  // Defense-in-depth only: the sole caller is the worker that just
-  // atomically claimed this job via claimJob(), so status should
-  // always be PROCESSING here. A throw here indicates an unexpected
-  // code path, not a normal race outcome.
   if (!job) throw new Error(`markCompleted: job ${id} not found or not in PROCESSING state`);
   return job;
 }
 
 // Retained from Phase 3/4 for backward compatibility. Not called by the
-// consumer (superseded by markRetrying/markDeadLettered).
+// consumer.
 export async function markFailed(id: string, errorMessage: string): Promise<Job> {
   const result = await pool.query<Job>(
     `UPDATE jobs
@@ -106,11 +94,18 @@ export async function markRetrying(id: string, errorMessage: string): Promise<Jo
   return job;
 }
 
+// Phase 6: also records last_dead_lettered_at/last_dead_letter_reason.
+// These are set here and NEVER cleared elsewhere (not by replay, not by
+// a subsequent successful completion) -- preserving the fact that this
+// job previously reached DEAD_LETTERED, per the project's requirement
+// not to erase failure history.
 export async function markDeadLettered(id: string, errorMessage: string): Promise<Job> {
   const result = await pool.query<Job>(
     `UPDATE jobs
      SET status = 'DEAD_LETTERED',
          last_error = $2,
+         last_dead_lettered_at = now(),
+         last_dead_letter_reason = $2,
          updated_at = now()
      WHERE id = $1
        AND status = 'PROCESSING'

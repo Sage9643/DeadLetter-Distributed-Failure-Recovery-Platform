@@ -272,3 +272,101 @@ transient/infrastructure failures) can turn a trivial bad-input mistake
 into a sustained resource-consuming loop. This was found through manual
 testing, not code review -- a concrete argument for why the project's
 emphasis on real execution over assumed correctness matters.
+
+
+## Deliberate Test 3 — DB/RabbitMQ dual-write gap reproduced on the replay path
+
+**Date:** 2026-09-10
+
+**Purpose:** Verify whether the DB/RabbitMQ consistency limitation
+tracked since Phase 0/2 (Deliberate Test 2) also applies to the new
+Phase 6 replay write path, rather than assuming it does.
+
+**Procedure:**
+1. Created and dead-lettered a job (id 7c305a47-5624-4300-bce4-9db927538834)
+2. Stopped RabbitMQ (`docker compose stop rabbitmq`), confirmed
+   PostgreSQL remained healthy
+3. Called POST /api/jobs/:id/replay against the dead-lettered job
+
+**Observed behavior:**
+- Request returned HTTP 500 with a raw, unhandled stack trace:
+  `IllegalOperationError: Channel closed` at publishJobCreated
+- Database query immediately after confirmed: status=QUEUED,
+  replay_count=1 -- the atomic claimReplay UPDATE had already
+  committed successfully (it has no RabbitMQ dependency) BEFORE the
+  publish attempt failed
+- Restarted RabbitMQ, confirmed healthy via `docker compose ps`
+- Re-queried the job: still status=QUEUED, unchanged, even with
+  RabbitMQ fully healthy again -- no automatic recovery occurred
+
+**Conclusion:** The dual-write gap first identified in Phase 0/2 is
+confirmed to apply identically to the replay path. A job can be
+genuinely, permanently stuck in QUEUED with no message ever published
+and no automatic detection or recovery mechanism.
+
+**Not fixed.** Consistent with the project's standing decision not to
+implement an outbox pattern without further justification. This test
+adds a second, independent confirmation of the same known limitation
+class, not a new problem.
+
+## Incident 5 — API RabbitMQ channel does not recover after broker restart
+
+**Date:** 2026-09-10
+
+**Trigger:** RabbitMQ was deliberately stopped during Deliberate Test 3
+(above).
+
+**Expected behavior:** After RabbitMQ was restarted and confirmed
+healthy, subsequent API operations requiring a publish should succeed
+normally.
+
+**Actual behavior:** A subsequent, UNRELATED `POST /api/jobs` request
+(creating a fresh job, `phase6_regression_stale`, for an entirely
+separate regression test) ALSO failed with the identical error:
+`IllegalOperationError: Channel closed` at publishJobCreated -- even
+though RabbitMQ had already been restarted and `docker compose ps`
+confirmed it healthy. This confirmed the failure was not specific to
+the replay path, but affected all API publishing.
+
+**Root cause (confirmed via code inspection, not speculated):**
+`apps/api/src/queue/connection.ts`'s `getChannel()` caches the channel
+in a module-level variable and checks only whether that variable is
+non-null before deciding whether to reconnect -- it never checks
+whether the cached channel/connection are still actually alive. No
+event listeners (`connection.on('close', ...)`,
+`channel.on('close', ...)`, etc.) are registered anywhere in the file,
+so nothing ever detects the broker disconnection and resets the cached
+references to null. The stale, dead Channel object remained cached
+indefinitely; amqplib's own internal closed-state check is what threw
+`IllegalOperationError` synchronously on every subsequent `.publish()`
+call against it.
+
+**Recovery:** Restarting the API process (`npm run dev`) re-initialized
+the module, resetting `channel`/`connection` to null, which forced a
+genuine fresh `amqp.connect()` on the next request. Confirmed real:
+the next POST /api/jobs succeeded normally (201) immediately after
+restart.
+
+**Impact:** API publish operations (both job creation and replay) can
+remain completely unavailable after ANY broker restart or connection
+drop, for an indefinite period, until someone notices and manually
+restarts the API process. No automatic detection, alerting, or recovery
+exists.
+
+**Current mitigation:** None automated. Manual API process restart is
+the only recovery path currently available.
+
+**Not fixed in Phase 6.** Per explicit instruction, no implementation
+change was made. Automatic RabbitMQ connection/channel recovery
+(reconnection logic with event-listener-driven cache invalidation, and
+likely a retry/backoff strategy for reconnection attempts) is
+identified as a concrete future improvement, out of scope for this
+phase.
+
+**Engineering lesson:** A cached resource (connection, channel, client)
+needs an explicit invalidation path tied to the actual liveness of the
+underlying resource, not just a "does this variable exist" check.
+Discovering this required deliberately breaking the same dependency
+(RabbitMQ) that Phase 0/2's original dual-write test already targeted --
+a second, unplanned finding surfaced by intentionally causing a real
+failure, not by code review.

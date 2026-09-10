@@ -136,3 +136,53 @@ continues to provide only at-least-once delivery; deduplication and
 concurrency safety are the consuming application's responsibility, now
 correctly implemented and verified under a real concurrent race. See
 failure-handling.md and development-log.md (Test 4).
+
+
+## Phase 6 update -- replay reuses existing topology unchanged
+
+No new exchange, queue, or routing key. Replay calls the SAME
+publishJobCreated(jobId) function used by original job creation
+(apps/api/src/queue/publisher.ts, unmodified), publishing the same thin
+{jobId} message to deadletter.jobs.exchange / job.created. This is a
+direct payoff of the Phase 2 decision to keep messages thin and
+Postgres authoritative -- the worker has no way to distinguish a
+replayed message from an original one, and does not need to.
+
+### DLQ messages are NOT removed on replay -- verified tradeoff
+
+Chosen design (see engineering-decisions.md for full rationale):
+replay updates PostgreSQL and publishes a fresh message; the ORIGINAL
+DLQ message for that dead-letter event is left untouched in
+deadletter.jobs.dlq permanently.
+
+Verified real consequence: after job 03a4cfcd-72d3-4e32-925d-5bef85425ceb
+was replayed and reached COMPLETED, deadletter.jobs.dlq's Ready count
+was still 10 (unchanged) -- confirmed via RabbitMQ management UI. The
+DLQ's Ready count only ever increases (on new dead-letter events); it
+is never decremented by replay, regardless of whether the replay
+ultimately succeeds. This is intentional, not a bug: PostgreSQL remains
+the sole source of truth for whether a job is actually resolved.
+
+
+## Phase 6 update -- replay reuses existing topology (verified)
+
+No new exchange, queue, or routing key. Replay calls the SAME
+publishJobCreated(jobId) used by original job creation, publishing the
+same thin {jobId} message. Verified real: multiple replayed jobs were
+correctly picked up by the existing consumer with no special-casing.
+
+### DLQ messages NOT removed on replay -- verified real
+
+Confirmed via RabbitMQ management UI across the verification session:
+deadletter.jobs.dlq Ready count remained unchanged (13) both after a
+job re-failed post-replay (Test 1) AND after a job succeeded post-replay
+(Test 2). PostgreSQL remains the sole authority on whether a job is
+actually resolved; the DLQ is a permanent historical artifact.
+
+### Known limitation -- API RabbitMQ channel does not auto-recover
+
+Verified real (see incidents-and-failures.md): after RabbitMQ was
+stopped and restarted, the API's cached channel reference remained
+stale and unusable until the API process itself was restarted. This
+affects ALL API publishes (both original job creation and replay), not
+just replay specifically.

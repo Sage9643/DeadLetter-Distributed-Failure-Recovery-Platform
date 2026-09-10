@@ -133,3 +133,76 @@ near-miss.
 
 See database.md, engineering-decisions.md, and failure-handling.md for
 full detail.
+
+
+## Phase 6 -- DLQ Inspection + Safe Replay
+
+Added one new explicit state transition: DEAD_LETTERED -> QUEUED, via
+POST /api/jobs/:id/replay only. No automatic replay exists.
+
+Full lifecycle, as implemented and verified:
+
+  JOB -> PROCESSING -> RETRIES -> DEAD_LETTERED -> [explicit replay]
+    -> QUEUED -> PROCESSING (existing claim path, unmodified)
+    -> COMPLETED or DEAD_LETTERED again
+
+Design principle preserved: replay does NOT introduce a second
+processing path. It performs exactly one atomic PostgreSQL write
+(DEAD_LETTERED -> QUEUED) and publishes the existing thin {jobId}
+message via the unmodified publishJobCreated() function. From that
+point forward, the replayed job is indistinguishable to
+apps/worker/src/consumer.ts from any other QUEUED job -- consumer.ts
+was NOT modified in this phase, confirming the design stayed minimal.
+
+Verified end-to-end (see development-log.md for full real evidence):
+- Replay of a DEAD_LETTERED job with an unresolved failure condition
+  correctly re-fails and re-dead-letters (jobId
+  6d0addf3-921c-47f5-86bb-ca495545d415)
+- Replay of a DEAD_LETTERED job with the failure condition cleared
+  correctly reaches COMPLETED, with the retry/backoff machinery working
+  identically to a first-time job (jobId
+  03a4cfcd-72d3-4e32-925d-5bef85425ceb)
+- Two concurrent replay requests for the same job: exactly one wins
+  (verified via replay_count=1, not 2, plus millisecond-level claim
+  timestamp overlap) (jobId 26a1f8db-6822-4563-86e0-16e2e505ed60)
+
+
+## Phase 6 -- DLQ Inspection + Safe Replay (Verified)
+
+One new explicit state transition: DEAD_LETTERED -> QUEUED, via
+POST /api/jobs/:id/replay only. No automatic replay exists.
+
+  JOB -> PROCESSING -> RETRIES -> DEAD_LETTERED -> [explicit replay]
+    -> QUEUED -> PROCESSING (existing Phase 5 claim path, unmodified)
+    -> COMPLETED or DEAD_LETTERED again
+
+consumer.ts was NOT modified. Replay performs exactly one atomic
+PostgreSQL write (DEAD_LETTERED -> QUEUED) and publishes the existing
+thin {jobId} message via the unmodified publishJobCreated(). From that
+point the replayed job is indistinguishable to the worker from any
+other QUEUED job.
+
+### Verified real evidence (see development-log.md for full detail)
+
+- Replay of a job whose failure condition was NOT fixed correctly
+  re-fails and re-dead-letters (job 6d0addf3...)
+- Replay of a job whose failure condition WAS fixed correctly reaches
+  COMPLETED, with Phase 4's retry/backoff logic unaffected (job
+  03a4cfcd...)
+- A replayed job that hits a retryable failure correctly re-runs the
+  FULL independent 5-attempt backoff cycle, timing measured within
+  3-7ms of calculated values (job 2c45f4f0...)
+- Two concurrent replay requests for the same job: exactly one wins,
+  verified via 14ms claim-timestamp overlap and replay_count=1 (job
+  26a1f8db..., evidence reused from the deterministic concurrency-test
+  session, not re-run during this verification pass)
+- Phase 5's stale-PROCESSING reclaim mechanism re-verified working
+  correctly, unaffected by Phase 6 (job 91842b6d...)
+
+### Known limitations discovered during verification
+
+- DB/RabbitMQ dual-write gap (tracked since Phase 0/2) reproduced for
+  real on the replay path specifically -- see failure-handling.md and
+  incidents-and-failures.md
+- API RabbitMQ channel does not auto-recover after a broker restart --
+  see incidents-and-failures.md

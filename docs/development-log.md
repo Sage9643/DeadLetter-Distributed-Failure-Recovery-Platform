@@ -881,3 +881,236 @@ worker process(es), not simulated.
 - The losing side's rejection reason (currentStatus at time of failure)
   is meaningful diagnostic evidence for whether a race was genuine
   (PROCESSING) versus sequential-after-the-fact (a terminal status)
+
+
+## Phase 6 -- DLQ Inspection + Safe Replay: Implementation and Real Test Results
+
+**Date:** 2026-09-09 (session date per timestamps; note: some earlier
+Phase 6 session timestamps reference 2026-09-10 due to date rollover
+mid-session)
+
+### What we built
+- Migration 002: total_attempt_count, replay_count,
+  last_dead_lettered_at, last_dead_letter_reason columns
+- apps/worker/src/services/jobService.ts: claimJob now also increments
+  total_attempt_count (same atomic UPDATE, WHERE clause unchanged from
+  Phase 5); markDeadLettered now also records
+  last_dead_lettered_at/reason
+- apps/api/src/services/jobService.ts: new claimReplay (atomic
+  DEAD_LETTERED->QUEUED conditional UPDATE)
+- apps/api/src/validation/jobSchema.ts: jobIdParamSchema (UUID format)
+- apps/api/src/config/env.ts: REPLAY_TEST_DELAY_MS (test-only, default 0)
+- apps/api/src/routes/jobs.ts: POST /:id/replay; UUID validation added
+  to GET /:id and the new route
+
+consumer.ts was NOT modified -- confirmed the design goal that replay
+requires zero changes to the existing worker claim/retry/DLQ logic.
+
+### Real test results (all against real Postgres/RabbitMQ/worker/API, no fabrication)
+
+**Test 1 -- basic replay, unresolved failure (jobId
+6d0addf3-921c-47f5-86bb-ca495545d415):** Created with
+shouldFailPermanently=true, dead-lettered immediately (non-retryable
+path). Replayed: 200, replayCount=1. Worker log confirmed attempt reset
+to 1 (not 2) before re-incrementing, re-failed via the same
+non-retryable condition, dead-lettered again. Final DB: DEAD_LETTERED,
+attempt_count=1, total_attempt_count=2, replay_count=1,
+last_dead_lettered_at populated.
+
+**Test 2 -- replay to success (jobId
+03a4cfcd-72d3-4e32-925d-5bef85425ceb):** Created with shouldFail=true,
+exhausted all 5 attempts with backoff timing matching calculated values
+within ~10-40ms (2000/2039, 4000/2021->actually measured against
+raw logs: attempt gaps 2054ms, 4017ms, 8009ms, 16018ms against
+scheduled 2000/4000/8000/16000 -- consistent with Phase 4/5 precision),
+reached DEAD_LETTERED, attempt_count=5, total_attempt_count=5. Payload
+manually cleared (UPDATE jobs SET payload='{}') to simulate "underlying
+issue fixed." Replayed: 200, replayCount=1. Worker log showed a single
+clean attempt (no retry) -> COMPLETED. Final DB: COMPLETED,
+attempt_count=1, total_attempt_count=6, replay_count=1,
+last_dead_lettered_at still populated (was_ever_dl=true) -- confirms
+dead-letter history survives eventual success.
+
+**Test 3 -- invalid-state rejections (jobId
+2ca21851-e189-48aa-8196-d3bc43ddc101 + synthetic ids):** Real job
+completed before replay was attempted; replay correctly returned 409
+with currentStatus="COMPLETED". Nonexistent UUID
+(00000000-0000-0000-0000-000000000000) returned 404. Malformed id
+("not-a-uuid") returned 400 on both POST /:id/replay and GET /:id.
+
+**Test 4 -- genuine concurrent replay race (jobId
+26a1f8db-6822-4563-86e0-16e2e505ed60), the critical test:** Created
+with shouldFailPermanently=true, dead-lettered. API restarted with
+REPLAY_TEST_DELAY_MS=3000. Two replay requests fired via a PowerShell
+Start-Job script; server received them 5ms apart (raw epoch:
+1789048063474 vs 1789048063479). Both independently completed their
+3000ms delay and reached "Attempting replay claim" 14ms apart (raw
+epoch: 1789048066488 vs 1789048066502). Winner: 200, replayCount=1.
+Loser: 409, currentStatus="QUEUED" (the winner's post-state, NOT a
+stale DEAD_LETTERED read -- direct evidence of genuine database-layer
+contention, not a sequential near-miss). Final DB confirmed the
+critical assertion: replay_count=1, not 2. (Job subsequently re-failed
+and re-dead-lettered after the replay, since shouldFailPermanently was
+never cleared for this job -- expected and correct given that payload.)
+
+**Test 5 -- DLQ Ready count unaffected by replay:** After Test 2's job
+reached COMPLETED via replay, deadletter.jobs.dlq showed Ready=10,
+Total=10 -- confirmed via RabbitMQ management UI screenshot. Count
+reflects all dead-letter events accumulated across this and prior test
+sessions (Phase 4/5 leftovers plus this phase's own); replaying a job
+to success did not decrement it. Confirms the documented tradeoff is
+real, not just asserted.
+
+### What remains to be tested (explicitly not verified this phase)
+- Replay rejection for a job in PROCESSING state specifically (relies
+  on the same WHERE clause verified against COMPLETED/QUEUED, not
+  independently exercised)
+- Replay rejection for a job in RETRYING state specifically (same)
+- Sustained dual-write failure on replay (DB succeeds, publish fails) --
+  not deliberately reproduced this phase, same class of risk as the
+  Phase 0/2 finding, not re-tested here
+
+### New risks introduced
+- Same dual-write risk as Phase 0/2, now also present on the replay
+  write path (DEAD_LETTERED->QUEUED update succeeding while the
+  subsequent publish fails). Documented, not solved, consistent with
+  the project's standing decision.
+
+### New incidents
+- None. No bugs were found during Phase 6 implementation or testing.
+
+### What we learned
+- The Phase 5 concurrency-test methodology (absolute or sufficiently-
+  aligned relative delay + explicit "attempting claim" timestamp
+  logging + the loser's observed intermediate state as diagnostic
+  evidence) generalizes cleanly to a second, structurally similar
+  atomic-claim scenario (replay) without needing new invention
+- A relative per-request delay is valid for proving concurrency when
+  both requests are dispatched by the same controlling script within
+  milliseconds of each other (this test) -- unlike Phase 5's original
+  flawed CLAIM_TEST_DELAY_MS, where delay was relative to two
+  independently-arriving RabbitMQ messages with no guaranteed
+  closeness in arrival time
+
+
+## Phase 6 -- Verification: Real Test Results
+
+**Date:** 2026-09-10
+
+All results below are from actual command execution against real
+PostgreSQL/RabbitMQ/API/worker processes during this verification
+session. No result is fabricated or upgraded from a lesser evidence
+category.
+
+### Migration
+Applied via ALTER TABLE ... ADD COLUMN IF NOT EXISTS against the live
+container (correct method given the existing data volume -- init-db
+scripts only auto-run on first initialization). Verified via both
+`\d jobs` and `information_schema.columns` query -- all 4 new columns
+match approved types/nullability/defaults exactly.
+
+### Test 1 -- Basic replay: PASS, with one sub-item NOT CAPTURED
+Job e25c2f4a-a3b8-4610-b46f-3c493bc0f17d. Pre-replay DEAD_LETTERED
+state VERIFIED (attempt_count=1, replay_count=0, dead-letter metadata
+populated). HTTP 200 replay response VERIFIED. Post-cycle final state
+VERIFIED (total_attempt_count=2, replay_count=1). Intermediate
+QUEUED/attempt_count=0 state immediately after replay: NOT CAPTURED --
+the worker consumed the message before sequential manual psql commands
+could observe it (worker claim-to-completion time was under 60ms in
+every measured case this session).
+
+### Test 2 -- Successful replay: PASS
+Job dbf275f3-62bc-4f26-b979-a4054ff51594. Exhausted 5 attempts
+naturally (DEAD_LETTERED, attempt_count=5, total_attempt_count=5).
+Payload manually cleared, replayed: HTTP 200. Single clean post-replay
+attempt (no retry) -> COMPLETED. Final: attempt_count=1,
+total_attempt_count=6, replay_count=1, last_dead_lettered_at unchanged
+from original exhaustion. RabbitMQ verified: main queue Ready=0/Unacked=0;
+DLQ Ready=13 both before and after (unchanged).
+
+Note: first attempt at this test failed due to a test-execution mistake
+(an unsubstituted placeholder in the replay curl command caused the
+command to never actually run) -- caught and corrected before
+proceeding; documented here for honesty rather than omitted.
+
+### Test 3 -- Retry after replay: PASS, including measured timing
+Job 2c45f4f0-8d95-4fb8-ae9e-a02c99b6d00a. Original cycle exhausted
+(5 attempts). Replayed WITHOUT clearing the failure condition -- worker
+log confirmed "attempt":1 (not 6) on the first post-replay claim,
+proving attempt_count genuinely reset. Full independent 5-attempt
+backoff cycle re-ran:
+
+Original cycle gaps: 2005ms/4006ms/8005ms/16005ms (scheduled
+2000/4000/8000/16000)
+Post-replay cycle gaps: 2005ms/4003ms/8005ms/16007ms (same schedule)
+
+All 8 measured gaps within 3-7ms of calculated exponential backoff.
+Second exhaustion -> DEAD_LETTERED again. Final: attempt_count=5,
+total_attempt_count=10, replay_count=1 (unchanged by the second
+exhaustion), last_dead_lettered_at updated to the second (most recent)
+event.
+
+### Test 4 -- Invalid replay states: PASS, all six cases
+- DEAD_LETTERED -> 200 (real, multiple jobs)
+- COMPLETED -> 409 (real, job 2ca21851..., naturally timed)
+- QUEUED -> 409 (real, concurrent-replay loser, job 26a1f8db...)
+- PROCESSING -> 409 (real request, against a state deterministically
+  forced via direct SQL UPDATE -- job c45719ad...)
+- RETRYING -> 409 (same method -- job 2c7351ec...)
+- Nonexistent UUID -> 404 (real)
+- Malformed UUID -> 400, both on POST /:id/replay and GET /:id (real)
+
+### Test 5 -- Concurrent replay: VERIFIED (evidence reused, not re-run)
+Per explicit instruction, this test was NOT re-executed during this
+verification session. The result is based entirely on evidence
+gathered during the earlier Phase 6 implementation session: job
+26a1f8db-6822-4563-86e0-16e2e505ed60, two replay requests dispatched
+5ms apart via a PowerShell Start-Job script, both reaching "Attempting
+replay claim" 14ms apart, winner HTTP 200, loser HTTP 409 with
+currentStatus="QUEUED" (the winner's post-state), final replay_count=1.
+
+### Redelivery / failure-loop safety: PASS
+Malformed/nonexistent UUID: confirmed structurally loop-proof (no
+AMQP requeue mechanism on this HTTP-only path) plus real 400/404
+responses already captured in Test 4.
+
+Publish-failure scenario: REPRODUCED FOR REAL. See
+incidents-and-failures.md, Deliberate Test 3 and Incident 5, for full
+detail. Job 7c305a47-5624-4300-bce4-9db927538834 confirmed permanently
+stuck in QUEUED even after RabbitMQ fully recovered -- a real,
+concrete instance of the known DB/RabbitMQ dual-write limitation.
+
+### Unplanned finding: Incident 5 -- API RabbitMQ channel-recovery gap
+Discovered as a direct consequence of the publish-failure test above.
+Root-caused via code inspection (not speculation): no event listeners
+registered on the connection/channel, so no invalidation of the cached
+channel reference occurs on disconnect. Full detail in
+incidents-and-failures.md. NOT fixed this phase, per instruction.
+
+### Phase 4/5 regression: PASS
+Stale-PROCESSING reclaim (Phase 5) re-verified: job
+91842b6d-0d41-4b6a-9f22-d34b83a76604, manually backdated to PROCESSING
+with a 90s-stale updated_at, successfully reclaimed and completed by
+the worker via the unmodified staleness branch of claimJob's WHERE
+clause. Bonus: two subsequent claim attempts against the now-COMPLETED
+job were both correctly rejected (currentStatus=COMPLETED),
+re-confirming the terminal-state guard.
+
+Note: this test's actual execution sequence (worker restart discovering
+an already-queued message, rather than a fresh manual redelivery)
+differed slightly from the originally planned script, due to the API
+restart required by Incident 5 disrupting timing. The mechanism
+exercised and the evidence obtained are still valid and directly
+relevant -- documented honestly rather than presented as having gone
+exactly to plan.
+
+### Summary of known limitations carried forward or newly discovered
+- total_attempt_count/replay_count are aggregate-only; no
+  job_attempts table exists (by design, per project scope)
+- DB/RabbitMQ dual-write gap: now confirmed on both job creation
+  (Phase 2) and replay (Phase 6) paths; not solved, consistent with
+  standing decision against implementing an outbox pattern
+- API RabbitMQ channel does not auto-recover after broker restart
+  (Incident 5, newly discovered this phase); manual restart required
+- Basic replay's intermediate QUEUED state: NOT CAPTURED (observational
+  limitation of manual sequential testing, not a functional gap)

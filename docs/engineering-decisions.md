@@ -290,3 +290,130 @@ different guarantee. Genuinely testing a duplicate against an actively
 PROCESSING (not yet terminal) job requires >= 2 concurrent consumers,
 which only Test 4 provides. Test 4 is now the sole test responsible for
 proving the core concurrency-race guarantee.
+
+
+## Decision: Replay attempt semantics -- reset attempt_count, add total_attempt_count and replay_count
+
+**Context:** Phase 4's retry/exhaustion logic (attempt_count >=
+max_attempts) needs to work correctly after a job is replayed, while
+the project also requires not silently erasing failure history.
+
+**Options considered:** (A) reset attempt_count to 0 only, (B) preserve
+attempt_count cumulatively across replays, (C) reset attempt_count
+per-cycle AND add a separate never-reset lifetime counter.
+
+**Chosen approach:** C.
+
+**Why:** B is a genuine correctness bug (see failure-handling.md for
+the exact failure mode), not a valid alternative -- it would cause a
+replayed job to dead-letter on its very first post-replay attempt with
+zero retries, since the exhaustion check compares against the already-
+maxed cumulative count. A alone loses the lifetime-attempts fact
+entirely. C is the smallest design that is both correct (verified: job
+6d0addf3... shows attempt:1, not 6, after replay) and non-lossy
+(verified: job 03a4cfcd... shows total_attempt_count=6 after replay-to-
+success).
+
+**Trade-offs:** total_attempt_count is aggregate only -- no per-attempt
+detail (timestamps, individual errors) without a job_attempts table,
+which was deliberately not introduced this phase to keep the change
+minimal.
+
+## Decision: DLQ messages are not removed on replay
+
+**Context:** Should replay attempt to consume/remove the corresponding
+message from deadletter.jobs.dlq?
+
+**Options considered:** (1) consume and remove the specific DLQ
+message, (2) leave PostgreSQL as sole authority, leave the DLQ message
+untouched.
+
+**Chosen approach:** 2.
+
+**Why:** AMQP queues are not queryable/addressable by content -- there
+is no way to "remove message X" from a queue without consuming
+(and re-publishing everything else) or using the RabbitMQ Management
+API, both explicitly disallowed as unnecessary infrastructure for this
+phase. Option 2 requires zero new infrastructure and directly extends
+the project's standing Phase 0 principle that PostgreSQL, not RabbitMQ,
+is authoritative for job state.
+
+**Trade-off, explicitly accepted and verified:** the DLQ's Ready count
+never decreases due to replay, even after a replayed job succeeds.
+Confirmed real: Ready=10 in deadletter.jobs.dlq, unchanged after job
+03a4cfcd... reached COMPLETED via replay. This must not be mistaken for
+a bug -- it is the direct, intended consequence of this decision.
+
+## Decision: Duplicate replay protection reuses Phase 5's atomic-claim pattern exactly
+
+**Context:** Two concurrent replay requests for the same job must not
+both succeed.
+
+**Chosen approach:** A single atomic conditional UPDATE (claimReplay),
+structurally identical in shape to Phase 5's claimJob -- WHERE
+status='DEAD_LETTERED', no preliminary SELECT.
+
+**Why:** Reuses an already-proven correctness pattern rather than
+inventing a new mechanism. No Redis or other distributed lock needed,
+consistent with the project's standing constraint.
+
+**Verification:** Genuine concurrent race reproduced via two HTTP
+requests fired 5ms apart, both delayed identically (REPLAY_TEST_DELAY_MS,
+test-only) to force overlap at the actual claim. Claim attempts landed
+14ms apart; the loser's observed currentStatus was QUEUED (the winner's
+post-state), not a stale DEAD_LETTERED read -- proving real contention,
+not a sequential near-miss. Final replay_count=1 confirms only one
+UPDATE committed.
+
+## Decision: RETRYING jobs are not replayable
+
+**Context:** Should an already-RETRYING job be eligible for manual
+replay?
+
+**Chosen approach:** No -- rejected with 409, same as any other
+non-DEAD_LETTERED status.
+
+**Why:** A RETRYING job already has an automatic TTL-based retry
+scheduled through the existing RabbitMQ retry queue (Phase 4). Allowing
+a manual replay to run concurrently would race a manual message against
+the automatic one, adding complexity for no real benefit -- the job is
+already on a path toward its own outcome.
+
+**Trade-off:** No way to "skip ahead" of a pending backoff wait via
+replay. Considered a minor, acceptable UX limitation, not a correctness
+gap.
+
+## Decision: UUID format validation added to GET /:id and POST /:id/replay
+
+**Context:** Incident 4 (Phase 5) showed that an invalid UUID reaching
+PostgreSQL raises error code 22P02, which -- if unhandled -- surfaces
+as a raw, unhandled 500 with a leaked stack trace.
+
+**Chosen approach:** A shared Zod schema (jobIdParamSchema) validates
+:id as UUID-format before either route queries the database, returning
+a clean 400 instead.
+
+**Why:** Directly closes the same error class Incident 4 already
+identified, now on the API side rather than just the worker side.
+Minimal, targeted fix -- no broader error-handling redesign attempted
+this phase (that gap, first flagged in Phase 2's Deliberate Test 2,
+remains open and tracked, not solved here).
+
+**Verification:** Real request to POST /api/jobs/not-a-uuid/replay and
+GET /api/jobs/not-a-uuid both returned 400 {"error":"Invalid job id
+format"}.
+
+
+## Addendum: Phase 6 decisions confirmed correct under real verification
+
+All Phase 6 engineering decisions (attempt semantics Option C, DLQ
+messages left untouched, duplicate-replay protection reusing Phase 5's
+atomic pattern, RETRYING rejected) were subsequently verified against
+real execution -- see failure-handling.md and development-log.md for
+full evidence. No decision required revision as a result of
+verification; two additional limitations were discovered during
+verification itself (see incidents-and-failures.md): the DB/RabbitMQ
+dual-write gap applying to the replay path (expected, consistent with
+the already-known Phase 0/2 limitation, not a new decision) and the API
+RabbitMQ channel-recovery gap (a newly discovered, separate limitation,
+not previously documented).
