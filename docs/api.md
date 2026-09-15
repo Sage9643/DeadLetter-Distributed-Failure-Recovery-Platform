@@ -146,3 +146,45 @@ failure-handling.md.
 
 Now also returns `400 {"error":"Invalid job id format"}` for a
 malformed :id. Verified real.
+
+
+## GET /api/stats (Phase 8)
+
+PostgreSQL-backed aggregate operational stats. Does not query RabbitMQ.
+
+**Response -- `200 OK`:**
+```json
+{
+  "totalJobs": 123,
+  "byStatus": { "QUEUED": 5, "PROCESSING": 2, "RETRYING": 3, "COMPLETED": 100, "DEAD_LETTERED": 10, "FAILED": 3 },
+  "totalReplays": 12,
+  "totalAttempts": 245
+}
+```
+Verified real via seeded-state integration test (2 tests, both passing).
+See observability.md for full field derivation and what this endpoint
+deliberately does not measure.
+
+## GET /api/health (Phase 8: reclassified as liveness, behavior unchanged)
+
+Unchanged from Phase 1. `200 {"status":"ok"}`. No dependency checks.
+Now explicitly documented as the liveness endpoint, distinct from the
+new readiness endpoint below.
+
+## GET /api/health/ready (Phase 8, new)
+
+Dependency readiness check. Real `SELECT 1` against PostgreSQL, real
+`checkQueue()` against RabbitMQ.
+
+**All dependencies reachable -- `200 OK`:**
+```json
+{ "postgres": "ok", "rabbitmq": "ok" }
+```
+
+**Any dependency unreachable -- `503 Service Unavailable`:**
+```json
+{ "postgres": "ok", "rabbitmq": "error" }
+```
+Verified real (3 tests: liveness unchanged, readiness success, readiness
+failure with mocked RabbitMQ failure). See observability.md for the
+relationship to Incident 5.

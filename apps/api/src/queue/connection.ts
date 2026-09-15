@@ -22,7 +22,15 @@ export async function getChannel(): Promise<Channel> {
 
   return channel;
 }
-
+// Read-only, idempotent AMQP operation against a queue we already
+// assert on every getChannel() call. If the cached channel is dead
+// (e.g. after a broker restart, per Incident 5), this call fails --
+// which is the correct, honest readiness signal. Does not attempt any
+// reconnection; that remains a documented, out-of-scope limitation.
+export async function checkRabbitMQHealth(): Promise<void> {
+  const ch = await getChannel();
+  await ch.checkQueue(QUEUE_NAME);
+}
 export async function closeConnection(): Promise<void> {
   await channel?.close();
   await connection?.close();

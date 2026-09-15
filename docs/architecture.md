@@ -206,3 +206,28 @@ other QUEUED job.
   incidents-and-failures.md
 - API RabbitMQ channel does not auto-recover after a broker restart --
   see incidents-and-failures.md
+
+
+## Phase 8 -- Observability & Operational Visibility
+
+Added three new API routes (stats.ts, health.ts extracted from the
+former inline app.ts handler) and one new service (statsService.ts).
+No schema changes, no new topology, no new infrastructure.
+
+- GET /api/stats: PostgreSQL-only aggregate query. Never queries
+  RabbitMQ -- avoids introducing a second protocol/port coupling for
+  an operational-visibility endpoint.
+- GET /api/health vs GET /api/health/ready: liveness (process running)
+  is now explicitly distinguished from readiness (dependencies
+  reachable). Readiness performs real checks against both PostgreSQL
+  and RabbitMQ.
+- Worker: per-attempt processing duration added to existing structured
+  logs (log-level only, not persisted or aggregated). Graceful
+  shutdown (SIGTERM/SIGINT) added -- the worker previously had no
+  signal handling at all.
+
+consumer.ts's claim/retry/DLQ/ACK-NACK control flow, apps/api and
+apps/worker's jobService.ts files, and the replay route are all
+unchanged this phase -- confirmed via git diff against the Phase 7
+commit (bfceaf9), not merely assumed. See engineering-decisions.md and
+development-log.md for full verification detail.

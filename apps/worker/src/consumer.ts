@@ -83,6 +83,7 @@ export async function startConsumer(): Promise<void> {
       }
 
       let job;
+      let claimedAt = 0;
       try {
         log.info("Attempting atomic claim");
         job = await claimJob(jobId);
@@ -103,6 +104,7 @@ export async function startConsumer(): Promise<void> {
           return;
         }
 
+        claimedAt = Date.now();
         log.info(
           { type: job.type, attempt: job.attempt_count, maxAttempts: job.max_attempts },
           "Claimed job, marked PROCESSING"
@@ -125,24 +127,26 @@ export async function startConsumer(): Promise<void> {
         log.info("Executing processJob() -- this delivery won the claim and is now processing");
         await processJob(job);
         await markCompleted(jobId);
-        log.info("Job completed successfully");
+        const durationMs = Date.now() - claimedAt;
+        log.info({ durationMs }, "Job completed successfully");
         channel.ack(msg);
         return;
       } catch (processingErr) {
         const message = processingErr instanceof Error ? processingErr.message : String(processingErr);
         const nonRetryable = processingErr instanceof NonRetryableError;
         const exhausted = job.attempt_count >= job.max_attempts;
+        const durationMs = Date.now() - claimedAt;
 
         try {
           if (nonRetryable) {
             await markDeadLettered(jobId, message);
             await publishDeadLetter(jobId);
-            log.warn({ error: message, reason: "non-retryable" }, "Job failed permanently, sent to DLQ");
+            log.warn({ error: message, reason: "non-retryable", durationMs }, "Job failed permanently, sent to DLQ");
           } else if (exhausted) {
             await markDeadLettered(jobId, message);
             await publishDeadLetter(jobId);
             log.warn(
-              { error: message, attempt: job.attempt_count, maxAttempts: job.max_attempts, reason: "attempts-exhausted" },
+              { error: message, attempt: job.attempt_count, maxAttempts: job.max_attempts, reason: "attempts-exhausted", durationMs },
               "Job failed, max attempts reached, sent to DLQ"
             );
           } else {
@@ -150,7 +154,7 @@ export async function startConsumer(): Promise<void> {
             await markRetrying(jobId, message);
             await publishRetry(jobId, delayMs);
             log.warn(
-              { error: message, attempt: job.attempt_count, maxAttempts: job.max_attempts, delayMs },
+              { error: message, attempt: job.attempt_count, maxAttempts: job.max_attempts, delayMs, durationMs },
               "Job failed, scheduled for retry"
             );
           }

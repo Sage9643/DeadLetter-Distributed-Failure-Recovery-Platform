@@ -1198,3 +1198,92 @@ else added was new test infrastructure.
   replaces the compiler's implicit default exclusions (node_modules,
   outDir) rather than adding to them -- a real, easy-to-miss behavior
   that caused a full round of TS5055 errors until understood
+
+
+## Phase 8 -- Observability & Operational Visibility: Real Results
+
+**Date:** 2026-09-16
+
+### What we built
+- apps/api/src/services/statsService.ts -- single-query PostgreSQL
+  aggregate (getStats)
+- apps/api/src/routes/stats.ts -- GET /api/stats
+- apps/api/src/routes/health.ts -- GET /api/health (liveness, behavior
+  preserved byte-identical) + GET /api/health/ready (new, real Postgres
+  + RabbitMQ checks)
+- apps/api/src/app.ts -- mounts the two new routers, inline health
+  handler removed (moved verbatim into health.ts)
+- apps/api/src/queue/connection.ts -- added checkRabbitMQHealth()
+  (read-only channel.checkQueue call); getChannel/closeConnection and
+  all topology declarations unchanged
+- apps/worker/src/consumer.ts -- durationMs added to the four terminal
+  log lines; no control-flow, SQL, or ACK/NACK changes
+- apps/worker/src/index.ts -- SIGTERM/SIGINT graceful shutdown
+  (previously no signal handling existed at all)
+- Tests: statsService.test.ts (2), healthRoute.test.ts (3)
+- docs/observability.md (new)
+
+### Why
+Establishes real, PostgreSQL-derived operational visibility and honest
+dependency readiness reporting, directly motivated by a real prior
+incident (Incident 5) rather than speculative instrumentation.
+
+### Real test results
+Total: 38 tests, 0 failures. Phase 7's 33 pre-existing tests confirmed
+still passing across two independent full runs (regression: PASS).
+
+### Real problems encountered and resolved (process/authoring issues, not application bugs)
+
+1. **Misplaced test file.** statsService.test.ts was created in
+   apps/worker/src/__tests__/integration/ by mistake (worker has no
+   statsService module -- that only exists in apps/api). Caught via
+   `dir src/__tests__/integration` showing an unexpected file; deleted
+   from the worker and correctly created in apps/api instead. Confirmed
+   via a subsequent test run showing the correct 5-suite/27-test result
+   for apps/api and the file's absence from the worker's directory
+   listing.
+
+2. **Comments unintentionally dropped from consumer.ts.** The initial
+   full-file replacement given for consumer.ts's duration-logging
+   additions omitted four pre-existing explanatory comments (the 22P02
+   error explanation, the CLAIM_TEST_SYNC_EPOCH_MS test-hook
+   explanation, the claim-failure context comment, and the
+   infrastructure-failure comment) -- an error in constructing that
+   replacement text, not a user error. Caught via `git diff bfceaf9 --
+   apps/worker/src/consumer.ts` showing unexpected deletions alongside
+   the intended additions. Fixed by providing a corrected complete
+   file reconstructed from the confirmed original plus only the
+   approved additions; re-verified via a second diff showing additions
+   only, zero deletions.
+
+### Regression verification (Phase 3-7)
+`git diff bfceaf9 -- apps/api/src/services/jobService.ts
+apps/worker/src/services/jobService.ts apps/api/src/routes/jobs.ts`
+produced zero output -- confirmed byte-identical. consumer.ts's diff
+against bfceaf9 (post-fix) contains only additions: claimedAt
+declaration/assignment and durationMs computation/logging, appended to
+existing log-context objects. No conditional, SQL call, ACK/NACK
+decision, or existing log message string was altered.
+
+### What remains NOT implemented (explicitly, per approved scope)
+- No persisted/aggregate processing-latency metric (log-level
+  per-attempt only -- see observability.md)
+- No RabbitMQ queue-depth exposure via /api/stats
+- No correlation ID added to RabbitMQ messages or worker logs
+- Incident 5's underlying RabbitMQ reconnection gap remains unfixed --
+  the readiness endpoint only makes it detectable, not resolved
+
+### New risks introduced
+- None to production behavior. All additions are new routes/service
+  (stats, readiness) or additive logging/shutdown handling; no
+  existing control flow was altered, confirmed via git diff.
+
+### What we learned
+- Full-file replacements carry real risk of silently dropping content
+  that wasn't explicitly re-included -- a targeted diff/patch is safer
+  for editing an already-verified file, and when a full replacement is
+  used, the resulting diff must be reviewed line-by-line before
+  proceeding, not assumed correct from intent alone
+- Directory listings (`dir`) remain a cheap, reliable way to catch a
+  file created in the wrong location before it causes a confusing
+  downstream test-count mismatch

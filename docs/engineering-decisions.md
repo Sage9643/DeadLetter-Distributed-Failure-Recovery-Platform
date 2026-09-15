@@ -450,3 +450,91 @@ Phases 0-7 uses any TypeScript-7-specific language feature -- all
 application code uses standard TypeScript syntax that has behaved
 identically across major versions. This is purely a build-tooling
 version change, not an application-logic
+
+
+## Decision: /api/stats queries PostgreSQL only, never RabbitMQ
+
+**Context:** Operational stats could include RabbitMQ queue depth
+(literal AMQP Ready count) alongside PostgreSQL-derived job counts.
+
+**Chosen approach:** PostgreSQL only. QUEUED/RETRYING counts serve as
+an honest proxy for "work waiting."
+
+**Why:** Querying RabbitMQ's management HTTP API would introduce a
+second protocol/port coupling (management API on 15672, distinct from
+the AMQP connection already in use on 5672) purely for an
+observability endpoint, and a new failure mode for /api/stats itself.
+Consistent with the same reasoning that rejected RabbitMQ management
+API access for DLQ inspection in Phase 6.
+
+**Trade-off:** /api/stats cannot report literal in-flight AMQP message
+counts (e.g. messages currently sitting in the retry queue mid-backoff).
+Accepted -- PostgreSQL's QUEUED/RETRYING counts are close enough for
+operational visibility purposes and require no new coupling.
+
+## Decision: separate liveness (/api/health) and readiness (/api/health/ready) endpoints
+
+**Context:** The existing /api/health performed no dependency checks at
+all. Incident 5 (Phase 6) showed a real scenario -- a dead RabbitMQ
+channel after a broker restart -- invisible to any existing endpoint.
+
+**Chosen approach:** Keep /api/health as pure liveness (unchanged
+behavior). Add /api/health/ready performing real checks: PostgreSQL
+SELECT 1, RabbitMQ channel.checkQueue() (read-only, idempotent, against
+the already-asserted main queue -- no new topology).
+
+**Why:** Liveness and readiness answer genuinely different questions
+("is the process running" vs "can it actually do its job right now"),
+and conflating them would make liveness checks (often used by
+process supervisors to decide whether to restart a process) fire on
+transient dependency issues that don't actually require a process
+restart. Keeping them separate lets each be used for its correct
+purpose.
+
+**Explicitly NOT a fix for Incident 5:** the RabbitMQ channel still
+does not auto-recover; a 503 from this endpoint would still require a
+manual API restart to actually resolve, exactly as Incident 5
+documented. This endpoint only makes that broken state detectable
+instead of silent.
+
+## Decision: processing duration is log-level per-attempt only, not a persisted aggregate metric
+
+**Context:** The Phase 8 brief asked for processing latency where
+"accurately derivable." The existing schema's updated_at is overwritten
+on every status transition.
+
+**Chosen approach:** Capture a duration in-process (Date.now() at claim,
+delta at outcome) and include it in the existing structured log lines
+only. No new column, no aggregate/average exposed via /api/stats.
+
+**Why:** An aggregate latency metric computed from updated_at would be
+inaccurate for any retried job (only reflects the latest transition),
+and fabricating an average from inaccurate per-job data would violate
+the project's standing rule against fabricated metrics. The per-attempt
+log-level duration is genuinely accurate for what it measures (one
+attempt's processing time) and requires no schema change.
+
+**Trade-off:** No dashboard-ready aggregate latency number exists yet.
+Would require a job_attempts table (same limitation documented since
+Phase 1/6) to compute honestly at the aggregate level -- not introduced
+this phase to avoid unnecessary schema complexity for a metric that
+cannot yet be computed accurately.
+
+## Decision: correlation ID propagation through RabbitMQ remains out of scope
+
+**Context:** Phase 8 asked which worker log fields materially improve
+debugging; correlation IDs threading an API request through to worker
+logs was considered.
+
+**Chosen approach:** Not implemented. The thin {jobId} RabbitMQ message
+design (Phase 2) is preserved completely unchanged -- no new field
+added to the message payload.
+
+**Why:** jobId itself already provides real cross-process correlation
+(the same jobId appears in both API and worker structured logs,
+searchable identically to a dedicated correlation ID) without touching
+the message schema. Adding a distinct correlation ID would require
+either widening the thin-message contract Phase 2 deliberately chose,
+or deriving one from jobId anyway -- providing no practical benefit
+over using jobId directly. Explicitly a deliberate non-goal, not an
+oversight.
