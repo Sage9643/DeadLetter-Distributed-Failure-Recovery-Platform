@@ -1287,3 +1287,24 @@ decision, or existing log message string was altered.
 - Directory listings (`dir`) remain a cheap, reliable way to catch a
   file created in the wrong location before it causes a confusing
   downstream test-count mismatch
+
+
+## Phase 9 -- React Operational Dashboard + Real-Time Updates: Real Results
+
+**Date:** 2026-09-16
+
+### What we built
+- apps/api: GET /api/jobs (listRecentJobs), changeDetector.ts (pure,
+  deterministically-tested diff logic), changePoller.ts (scheduling
+  wrapper), broadcaster.ts, WebSocket server attached to the existing
+  http.Server in index.ts, graceful shutdown (API previously had none)
+- apps/dashboard: complete new Vite/React app -- Overview, JobList,
+  JobDetail, StatusBadge components, REST client, useJobEvents WS hook
+  with exponential-backoff reconnection, 15s periodic REST refresh
+
+### Why
+Establishes the first operational dashboard, with real-time
+notifications built on the existing PostgreSQL-as-source-of-truth
+architecture rather than new infrastructure.
+
+### Real test results

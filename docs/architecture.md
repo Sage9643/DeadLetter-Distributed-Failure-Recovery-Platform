@@ -231,3 +231,32 @@ apps/worker's jobService.ts files, and the replay route are all
 unchanged this phase -- confirmed via git diff against the Phase 7
 commit (bfceaf9), not merely assumed. See engineering-decisions.md and
 development-log.md for full verification detail.
+
+
+## Phase 9 -- React Operational Dashboard + Real-Time Updates
+
+New apps/dashboard workspace (React + Vite), consuming existing REST
+endpoints plus one new one (GET /api/jobs). WebSocket infrastructure
+added to apps/api only -- apps/worker requires ZERO changes, confirmed
+via git diff against commit 7ae6feea showing consumer.ts and worker's
+jobService.ts completely absent from the diff.
+
+### WebSocket ownership and design
+
+The API owns the WebSocket server, attached to the SAME http.Server
+Express already uses (no second port). A background poller inside the
+API process (apps/api/src/ws/changePoller.ts) queries PostgreSQL every
+2 seconds for jobs changed since a cursor, and broadcasts a minimal
+job.updated notification for each. This deliberately avoids a
+worker-to-API push design (which would require touching consumer.ts
+and creating a new runtime coupling between the two processes) in favor
+of the API independently watching its own source of truth.
+
+apps/api/src/app.ts was deliberately NOT modified -- the WebSocket
+server and poller are bootstrapped only in index.ts, so the 38 existing/
+new API tests (which import app via supertest) are structurally
+unaffected. Confirmed via git diff: app.ts shows zero changes against
+7ae6feea.
+
+See message-flow.md equivalent content in api.md and full rationale in
+engineering-decisions.md.

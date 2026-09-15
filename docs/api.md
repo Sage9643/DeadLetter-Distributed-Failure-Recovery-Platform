@@ -188,3 +188,45 @@ Dependency readiness check. Real `SELECT 1` against PostgreSQL, real
 Verified real (3 tests: liveness unchanged, readiness success, readiness
 failure with mocked RabbitMQ failure). See observability.md for the
 relationship to Incident 5.
+
+
+## GET /api/jobs (Phase 9, new)
+
+Fixed recent-activity list for the dashboard. No pagination this phase.
+
+**Response -- `200 OK`:**
+```json
+{
+  "jobs": [
+    { "id": "...", "type": "...", "status": "...", "attempt_count": 0, "max_attempts": 5, "created_at": "...", "updated_at": "..." }
+  ]
+}
+```
+- Ordered by `updated_at DESC` (most recently ACTIVE, not merely most
+  recently created)
+- `LIMIT 20`, fixed, no query parameters
+- Returns only the 7 fields listed above -- not every job column (that
+  remains GET /api/jobs/:id's role)
+
+Verified real: 3 integration tests (empty table, ordering/limit with 25
+seeded rows, exact field-set assertion), 2 supertest route tests.
+
+## WebSocket endpoint: ws://<host>/ws (Phase 9, new)
+
+Notification-only channel, attached to the same HTTP server/port as the
+REST API. Never carries authoritative job data.
+
+**Event contract:**
+```json
+{ "type": "job.updated", "jobId": "...", "status": "...", "updatedAt": "..." }
+```
+
+On receipt, clients are expected to refetch via the REST endpoints
+above (GET /api/stats, GET /api/jobs, GET /api/jobs/:id) rather than
+trust the event payload. See observability.md and
+engineering-decisions.md for the full missed-event-recovery rationale
+and the PostgreSQL polling design (including startup cursor strategy).
+
+Verified real: a genuine WebSocket server + real client connection over
+a real ephemeral local port, asserting the client actually receives a
+broadcast event matching the exact contract above.

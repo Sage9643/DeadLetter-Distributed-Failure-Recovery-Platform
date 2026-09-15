@@ -44,6 +44,33 @@ export async function getJobById(id: string): Promise<Job | null> {
 
   return result.rows[0] ?? null;
 }
+export interface RecentJob {
+  id: string;
+  type: string;
+  status: string;
+  attempt_count: number;
+  max_attempts: number;
+  created_at: string;
+  updated_at: string;
+}
+
+// Phase 9: fixed recent-activity list for the dashboard. LIMIT 20, no
+// pagination (per approved design). Ordered by updated_at DESC --
+// surfaces the most recently ACTIVE jobs (including retries/replays
+// touching an old job), not merely the most recently created ones,
+// which is more operationally useful for an "at a glance" view.
+// Returns only the columns the dashboard's recent-jobs table actually
+// needs, not every column (unlike getJobById, which intentionally
+// returns everything for the detail view).
+export async function listRecentJobs(): Promise<RecentJob[]> {
+  const result = await pool.query<RecentJob>(
+    `SELECT id, type, status, attempt_count, max_attempts, created_at, updated_at
+     FROM jobs
+     ORDER BY updated_at DESC
+     LIMIT 20`
+  );
+  return result.rows;
+}
 
 // Phase 6: Atomic conditional replay claim. Structurally identical to the
 // worker's claimJob (Phase 5) -- a single UPDATE with the eligibility

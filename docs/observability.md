@@ -120,3 +120,135 @@ comments, caught via `git diff` review before commit and fully
 restored, re-verified via a clean diff showing additions only. Neither
 incident affected application logic or test outcomes; both were caught
 and corrected before this documentation was written.
+
+
+## Phase 9 -- Real-Time Dashboard Notifications
+
+### Architecture: PostgreSQL polling, not worker push
+
+apps/api runs an internal poller (2-second interval) querying
+`SELECT id, status, updated_at FROM jobs WHERE updated_at > $cursor
+ORDER BY updated_at ASC`, broadcasting one job.updated WebSocket event
+per changed row to all connected dashboard clients. This requires ZERO
+changes to apps/worker -- the poller watches PostgreSQL directly
+(the existing source of truth), regardless of whether a change
+originated from a worker's claimJob/markCompleted/markRetrying/
+markDeadLettered or the API's own claimReplay.
+
+### Startup cursor strategy (addresses the historical-broadcast /
+missed-update race)
+
+The poller's starting cursor is established via `SELECT now()` run
+against PostgreSQL itself (not the Node process's clock), as the very
+first action before the poll interval begins. This means:
+- Nothing with an updated_at before that instant is ever broadcast
+  (no flood of historical jobs on API startup).
+- Nothing with an updated_at after that instant is missed (the first
+  poll tick's query is WHERE updated_at > cursor, and there is no
+  separate "initialization window" -- the cursor IS the first thing
+  established).
+
+**Accepted edge case, not engineered around further:** a row updated at
+the exact same microsecond as the cursor would be skipped once. No
+persistent event table or additional infrastructure was introduced to
+close this vanishingly unlikely gap -- REST remains authoritative
+regardless, so a skipped notification never produces incorrect
+dashboard state, only a delayed one (corrected by the next poll tick
+that catches the job's NEXT update, or the dashboard's own 15s periodic
+REST refresh, or a manual refresh).
+
+### Missed-event recovery
+
+WebSocket messages are notifications only, never authoritative data.
+The dashboard (apps/dashboard/src/App.tsx) refetches via REST on every
+received event rather than trusting the event payload, and additionally
+performs an independent 15-second periodic REST refresh regardless of
+WebSocket state. A dropped connection, a missed message, or the
+WebSocket server being entirely unavailable never leaves the dashboard
+permanently incorrect -- only temporarily stale until the next
+successful REST fetch.
+
+### Reconnection behavior
+
+apps/dashboard/src/ws/useJobEvents.ts implements exponential backoff
+reconnection (1s, 2s, 4s... capped at 15s) on disconnect. Connection
+state (connecting/open/closed) is surfaced in the dashboard UI header.
+
+### What this does NOT provide
+
+- Not instant push -- bounded by the 2-second poll interval. A job
+  transitioning through multiple states within one interval (e.g.
+  QUEUED->PROCESSING->COMPLETED inside 2s) is only broadcast once, at
+  its final observed state.
+- No index currently supports the poller's `WHERE updated_at > $1`
+  query -- acceptable at current/demo table sizes; flagged as a future
+  consideration if job volume grows substantially, not silently
+  ignored.
+- Correlation ID propagation through the WebSocket event: not added.
+  jobId alone provides sufficient correlation for this notification-
+  only channel, consistent with the same reasoning already documented
+  for RabbitMQ messages in Phase 8.
+
+## Phase 9 real test results
+Total: 17 suites, 62 tests, 0 failures. apps/dashboard build: clean (37
+modules, no errors).
+
+### Real incidents encountered and resolved
+1. **File-creation copy/paste corruption.** A terminal command
+   (`notepad apps\api\src\routes\jobs.ts`) got literally typed into the
+   file content instead of run separately, corrupting the first two
+   import lines with 21 resulting compile errors. Caught via `npx tsc`
+   output, fixed via a full verified-clean file replacement.
+2. **Missing vite/client ambient types.** `import "./styles.css"` failed
+   type-checking (TS2882) because tsconfig.json's `types` array didn't
+   include `vite/client`. Fixed by adding it; verified via a clean
+   `npx tsc -b --noEmit` and successful `npm run build`.
+3. **Ambiguous test fixture.** App.test.tsx used totalJobs=5 and
+   totalAttempts=5 simultaneously, causing `getByText("5")` to
+   correctly fail on finding two matching elements (a real test bug,
+   not a component bug -- the component rendered correctly). Fixed by
+   using distinct fixture values.
+4. **Stray shell-redirect artifact files.** Two small files (`e HEAD`,
+   `tatus`) appeared as untracked in git status -- confirmed to be
+   accidental output-redirection artifacts from earlier terminal
+   commands (containing literal `git log`/`git status` output), not
+   real project files. Deleted.
+5. **Uncommitted build artifact.** `apps/dashboard/tsconfig.tsbuildinfo`
+   (tsc's incremental-build cache) appeared as untracked. Added
+   `*.tsbuildinfo` to the root .gitignore rather than deleting it once,
+   preventing recurrence on future builds.
+6. **React act() warnings** in useJobEvents.test.ts (non-failing, but
+   noisy) -- mock WebSocket event dispatches happened outside React's
+   batching. Fixed by wrapping them in `act()`.
+
+None of these incidents involved application/business logic -- all were
+scaffolding, tooling, or test-authoring issues, caught and resolved
+before this report.
+
+### Regression verification against commit 7ae6feea35c658196514dfc7f50c4e913ccbe1c0
+- apps/worker/src/consumer.ts: absent from diff -- UNCHANGED
+- apps/worker/src/services/jobService.ts: absent from diff -- UNCHANGED
+- apps/api/src/app.ts: absent from diff -- UNCHANGED (by design --
+  see engineering-decisions.md)
+- apps/api/src/services/jobService.ts: diff shows ONLY the new
+  listRecentJobs function inserted; createJob/getJobById/claimReplay
+  unchanged
+- apps/api/src/routes/jobs.ts: diff shows ONLY the new GET / handler
+  inserted; POST /, GET /:id, POST /:id/replay unchanged
+- No migration files added
+- claimJob, claimReplay, retry/backoff, DLQ, ACK/NACK, replay semantics:
+  all confirmed unchanged by the above
+
+### Known limitations (honest, not hidden)
+- Near-real-time only (2s poll bound), not instant push
+- No index on jobs.updated_at supporting the poller query yet
+- 5 npm audit findings in apps/dashboard's dev-tooling
+  (vitest/vite/esbuild) investigated and accepted as dev-server-only
+  exposures, not force-upgraded this phase -- see
+  engineering-decisions.md
+- Dashboard not containerized (consistent with apps/api and
+  apps/worker's current state)
+- No authentication on the WebSocket endpoint (consistent with the
+  REST API, which also has none)
+- Incident 5 (RabbitMQ channel non-recovery) and the DB/RabbitMQ
+  dual-write gap remain unrelated to and unaffected by this phase

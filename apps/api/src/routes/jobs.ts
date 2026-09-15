@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { createJobSchema, jobIdParamSchema } from "../validation/jobSchema";
-import { createJob, getJobById, claimReplay } from "../services/jobService";
+import { createJob, getJobById, claimReplay, listRecentJobs } from "../services/jobService";
 import { publishJobCreated } from "../queue/publisher";
 import { env } from "../config/env";
 
@@ -22,6 +22,12 @@ jobsRouter.post("/", async (req, res) => {
   req.log.info({ jobId: job.id }, "Job created");
 
   res.status(201).json({ jobId: job.id, status: job.status });
+});
+
+jobsRouter.get("/", async (req, res) => {
+  const jobs = await listRecentJobs();
+  req.log.info({ count: jobs.length }, "Recent jobs list requested");
+  res.json({ jobs });
 });
 
 jobsRouter.get("/:id", async (req, res) => {

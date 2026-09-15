@@ -1,0 +1,39 @@
+* { box-sizing: border-box; }
+body { margin: 0; font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; }
+.app { max-width: 1000px; margin: 0 auto; padding: 24px; }
+.app-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px; flex-wrap: wrap; gap: 8px; }
+.connection-indicator { font-size: 0.8rem; padding: 4px 10px; border-radius: 12px; }
+.connection-open { background: #16a34a33; color: #4ade80; }
+.connection-connecting { background: #d9770633; color: #fbbf24; }
+.connection-closed { background: #dc262633; color: #f87171; }
+.stat-cards { display: flex; gap: 16px; margin-bottom: 24px; flex-wrap: wrap; }
+.stat-card { background: #1e293b; padding: 16px 24px; border-radius: 8px; min-width: 140px; }
+.stat-value { font-size: 2rem; font-weight: bold; }
+.stat-label { font-size: 0.85rem; color: #94a3b8; }
+.status-distribution { margin-bottom: 24px; }
+.status-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.status-row-label { width: 120px; font-size: 0.85rem; }
+.status-bar-track { flex: 1; background: #1e293b; border-radius: 4px; height: 16px; overflow: hidden; }
+.status-bar-fill { height: 100%; background: #2563eb; }
+.status-row-count { width: 32px; text-align: right; font-size: 0.85rem; }
+.job-table { width: 100%; border-collapse: collapse; }
+.job-table th, .job-table td { text-align: left; padding: 8px; border-bottom: 1px solid #1e293b; font-size: 0.85rem; }
+.job-row { cursor: pointer; }
+.job-row:hover { background: #1e293b; }
+.job-id { font-family: monospace; }
+.status-badge { color: white; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; }
+.job-fields { display: grid; grid-template-columns: max-content 1fr; gap: 4px 16px; margin: 12px 0; }
+.job-fields dt { color: #94a3b8; font-size: 0.85rem; }
+.job-fields dd { margin: 0; }
+.back-button { background: none; border: none; color: #60a5fa; cursor: pointer; margin-bottom: 12px; }
+.hint { font-size: 0.8rem; color: #94a3b8; }
+.replay-action button { background: #dc2626; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; }
+.replay-action button:disabled { opacity: 0.6; cursor: not-allowed; }
+.replay-success { color: #4ade80; }
+.replay-error { color: #f87171; }
+.empty-state, .loading-state { color: #94a3b8; }
+.global-error { background: #dc262633; color: #f87171; padding: 8px 16px; border-radius: 6px; }
+@media (max-width: 640px) {
+  .job-table { font-size: 0.75rem; }
+  .status-row-label { width: 90px; }
+}

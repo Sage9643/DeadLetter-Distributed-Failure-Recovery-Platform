@@ -538,3 +538,106 @@ either widening the thin-message contract Phase 2 deliberately chose,
 or deriving one from jobId anyway -- providing no practical benefit
 over using jobId directly. Explicitly a deliberate non-goal, not an
 oversight.
+
+
+## Decision: API polls PostgreSQL for change detection, rather than worker-push
+
+**Context:** Job state changes originate in two separate processes
+(worker: claimJob/markCompleted/markRetrying/markDeadLettered; API:
+claimReplay). Both need to reach WebSocket-connected dashboard clients,
+which only the API process manages.
+
+**Options considered:** (1) worker pushes an HTTP notification to an
+internal API endpoint after each terminal transition, (2) the API
+independently polls PostgreSQL for recent changes.
+
+**Chosen approach:** Option 2.
+
+**Why:** Option 1 requires touching consumer.ts (a network call after
+each of the four terminal log points, needing careful fire-and-forget
+handling so a slow/down API never affects ACK/NACK timing or retry
+correctness) and creates a new runtime coupling where worker
+reliability becomes entangled with API/dashboard availability --
+mirroring exactly the fragile inter-process coupling Incident 5 (Phase
+6) already demonstrated causes real, hard-to-detect breakage. Option 2
+requires zero worker changes (confirmed via git diff against 7ae6feea:
+consumer.ts and worker's jobService.ts are completely absent from the
+Phase 9 diff) and uniformly catches changes from ANY write path,
+because it watches the actual source of truth rather than
+instrumenting every individual call site.
+
+**Trade-off:** Near-real-time (2s bound) rather than instant push;
+intermediate rapid transitions within one interval are not individually
+broadcast. Explicitly acceptable -- the mandated WS-as-notification-only
+semantics never required instant delivery, only eventual, recoverable
+notification.
+
+## Decision: startup cursor via SELECT now(), not a default/historical timestamp
+
+**Context:** Approval feedback identified a real startup race: an
+in-memory cursor initialized to an old default would broadcast the
+entire historical jobs table on API boot; initializing it naively
+during startup could also create a window where an update is missed.
+
+**Chosen approach:** `SELECT now()` executed against PostgreSQL itself,
+as the literal first action before the poll interval begins -- see
+apps/api/src/db/changeDetector.ts's getStartupCursor().
+
+**Why:** Since the cursor IS the first thing established (one atomic
+query, no gap between "cursor set" and "polling begins" in which an
+update could slip through unaccounted-for), and every subsequent query
+is strictly `WHERE updated_at > cursor`, both failure modes are
+structurally avoided without a persistent event table or any new
+infrastructure. Verified via 3 real integration tests against
+deadletter_test (see changeDetector.test.ts): pre-existing jobs are
+never broadcast on a fresh cursor, and jobs updated after a cursor was
+established are always caught.
+
+**Trade-off, explicitly accepted:** a job updated at the exact same
+microsecond as the cursor could theoretically be skipped once. Not
+engineered around further -- REST remains authoritative, so this
+produces at most a temporarily stale dashboard, never an incorrect one.
+
+## Decision: separate app.ts (route registration) from index.ts (process bootstrap)
+
+**Context:** Where should the WebSocket server, poller, and graceful
+shutdown live -- inside app.ts (where routes are registered) or
+index.ts (where the process actually starts)?
+
+**Chosen approach:** Entirely in index.ts. app.ts remains a pure
+route-registration module with zero side effects, exactly as it was
+before Phase 9.
+
+**Why:** All 38 API tests import `app` directly via supertest, which
+creates its own ephemeral server around the plain Express app
+regardless of index.ts. If the WebSocket server or the 2-second poller
+interval were started as a side effect of importing app.ts, every test
+run would spin up a real timer/socket server it doesn't need, risking
+Jest open-handle warnings or flakiness. Confirmed structurally correct
+via git diff: app.ts shows zero changes against the Phase 8 commit.
+
+## Decision: dev-tooling npm audit findings (vitest/vite/esbuild) accepted, not force-upgraded
+
+**Context:** `npm install` in apps/dashboard reported 5 vulnerabilities
+(3 moderate, 1 high, 1 critical) via `npm audit`.
+
+**Investigated finding:** Both root advisories (@vitest/mocker path
+traversal, esbuild dev-server request handling) are exposures in the
+LOCAL DEVELOPMENT SERVER only -- a malicious website tricking a
+running `vite dev`/`vitest` process into leaking files or accepting
+requests. Neither affects the production `dist/` bundle actually
+shipped, and neither is reachable outside an actively-running local
+dev process.
+
+**Chosen approach:** Not run `npm audit fix --force` this phase. The
+fix would install vitest@5.0.1 and vite@8.x -- both unverified major
+version bumps against this project's actual test/config setup, the
+same category of blind-upgrade risk that caused real breakage in Phase
+7's ts-jest incident.
+
+**Why:** A verified, understood, dev-tooling-only exposure documented
+honestly is preferable to an unverified major-version force-upgrade
+applied reflexively mid-phase. Flagged as a genuine future task (verify
+vite 8.x/vitest 5.x compatibility with this project's config, then
+upgrade deliberately), not silently ignored or deferred without
+tracking.
