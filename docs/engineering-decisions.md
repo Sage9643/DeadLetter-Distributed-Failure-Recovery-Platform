@@ -417,3 +417,36 @@ dual-write gap applying to the replay path (expected, consistent with
 the already-known Phase 0/2 limitation, not a new decision) and the API
 RabbitMQ channel-recovery gap (a newly discovered, separate limitation,
 not previously documented).
+
+
+## Decision: Pin TypeScript to 6.0.3 for both apps, superseding the earlier ts-jest/TS7 workaround attempts
+
+**Context:** This project used TypeScript 7.0.2 since Phase 0. Phase 7's
+introduction of Jest/ts-jest revealed this version does not expose the
+classic JavaScript compiler API ts-jest requires for type-checked test
+transformation -- confirmed by two independently failing workaround
+attempts (see docs/testing.md for full detail), not merely a stale
+peer-dependency metadata issue as first suspected from ts-jest's
+changelog alone.
+
+**Options considered:** (1) `--legacy-peer-deps` to bypass the peer
+dependency check and use TypeScript 7 as-is, (2) alias a classic
+TypeScript release specifically for ts-jest via its `compiler` config
+option while keeping TypeScript 7 as the main devDependency, (3) pin
+both apps' actual `typescript` devDependency to a classic release
+(6.0.3) outright.
+
+**Chosen approach:** Option 3.
+
+**Why:** Options 1 and 2 were both tried first and both failed with
+real, different errors during actual test execution -- not assumptions,
+verified failures. Option 3 was discovered to already work by accident
+for the worker workspace (npm's resolver had nested a working
+`typescript@6.0.3` there without an explicit request), and once
+identified, was applied deliberately and explicitly to both apps.
+
+**Why 6.0.3 is safe for production code:** nothing implemented across
+Phases 0-7 uses any TypeScript-7-specific language feature -- all
+application code uses standard TypeScript syntax that has behaved
+identically across major versions. This is purely a build-tooling
+version change, not an application-logic

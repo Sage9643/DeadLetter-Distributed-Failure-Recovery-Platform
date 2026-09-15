@@ -1114,3 +1114,87 @@ exactly to plan.
   (Incident 5, newly discovered this phase); manual restart required
 - Basic replay's intermediate QUEUED state: NOT CAPTURED (observational
   limitation of manual sequential testing, not a functional gap)
+
+
+## Phase 7 -- Automated Testing: Real Test Results
+
+**Date:** 2026-09-15
+
+### What we built
+- Jest + ts-jest configured independently in apps/api and apps/worker,
+  each with a test-only tsconfig.json (adds "jest" to types without
+  touching the production tsconfig's types array)
+- deadletter_test database (same Postgres container), both migrations
+  applied, schema verified via information_schema equivalent to prior
+  phases
+- Two-layer test database safety (env-loading via setupFiles +
+  runtime SELECT current_database() check before any TRUNCATE)
+- Unit tests: calculateBackoffMs (4 tests), createJobSchema +
+  jobIdParamSchema (10 tests)
+- Integration tests against real Postgres: claimJob concurrency (worker),
+  claimReplay concurrency (api), state-machine preconditions for
+  markCompleted/markRetrying/markDeadLettered (worker)
+- API route tests via supertest against the real Express app object,
+  publishJobCreated mocked, all other logic real: UUID validation,
+  404, and the full 409 rejection matrix for the replay state machine
+
+### Why
+Establishes automated regression protection for the concurrency and
+state-machine guarantees proven manually across Phases 3-6, per the
+approved Phase 7 design.
+
+### Real test results
+Total: 33 tests, 0 failures. Full detail and the exact assertions proven
+are documented in docs/testing.md.
+
+### Real problems encountered and resolved
+A significant, genuine TypeScript 7 / ts-jest incompatibility was
+discovered and resolved during setup -- full diagnostic narrative in
+docs/testing.md and the decision rationale in engineering-decisions.md.
+Summary: two workaround attempts (--legacy-peer-deps; a compiler alias
+via ts-jest's `compiler` option) each failed with distinct real errors
+during actual execution; the working fix was pinning both apps'
+typescript devDependency to 6.0.3 explicitly. Several secondary,
+smaller issues were also hit and fixed along the way during manual file
+creation: a stray duplicate src/tests directory (deleted), a missing
+`exclude` array in each app's tsconfig.json causing TS5055
+"would overwrite input file" errors once introduced (fixed by
+explicitly re-listing dist alongside the new exclusion, since providing
+any custom exclude array replaces TypeScript's implicit default
+protection of outDir).
+
+### Regression verification (Phase 3-6)
+Confirmed via `git status` and `git diff` against the Phase 6 commit
+(27272fd): consumer.ts, createJob() (both apps' relevant service files),
+claimJob's WHERE clause, and the entire replay implementation are
+byte-for-byte unchanged. Only package.json/package-lock.json (new test
+dependencies + test script) and tsconfig.json (exclude array addition,
+incidental style cleanup) were modified in existing files; everything
+else added was new test infrastructure.
+
+### What remains untested (explicitly, per approved scope)
+- No real-publish integration test (RabbitMQ) -- optional, deferred
+- No multi-process worker end-to-end automation -- deferred
+- Retry/backoff timing precision -- covered only by prior manual
+  verification (Phases 4-6), not automated this phase
+
+### New risks introduced
+- None to production behavior. The TypeScript version pin is a build-
+  tooling change with no verified impact on application logic (clean
+  npx tsc build confirmed in both apps post-pin).
+
+### What we learned
+- A dependency's changelog claiming support for something is not
+  equivalent to verified-working support -- this is the same lesson
+  from Phase 2's amqplib version check, now reinforced by a case where
+  the changelog claim turned out to be premature/incomplete in practice
+- npm workspace dependency resolution can silently produce different
+  results for nominally-identical version ranges across sibling
+  workspaces (the worker's accidental correct nested resolution vs the
+  API's --legacy-peer-deps-forced incorrect hoisted one) -- worth
+  explicit `npm ls <package>` verification whenever two workspaces
+  behave differently despite matching package.json ranges
+- TypeScript's `exclude` field, when explicitly set, completely
+  replaces the compiler's implicit default exclusions (node_modules,
+  outDir) rather than adding to them -- a real, easy-to-miss behavior
+  that caused a full round of TS5055 errors until understood
