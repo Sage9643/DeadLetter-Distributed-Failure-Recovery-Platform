@@ -16,9 +16,13 @@ export default function Overview({ stats }: { stats: Stats }) {
           <div className="stat-value">{stats.totalReplays}</div>
           <div className="stat-label">Total Replays</div>
         </div>
-        <div className="stat-card">
+                <div className="stat-card">
           <div className="stat-value">{stats.totalAttempts}</div>
           <div className="stat-label">Total Attempts</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-value">{stats.pendingOutboxEvents}</div>
+          <div className="stat-label">Pending Outbox Events</div>
         </div>
       </div>
 

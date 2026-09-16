@@ -260,3 +260,34 @@ unaffected. Confirmed via git diff: app.ts shows zero changes against
 
 See message-flow.md equivalent content in api.md and full rationale in
 engineering-decisions.md.
+
+
+## Phase 10 -- Transactional Outbox (Durable Publication)
+
+Closes the DB/RabbitMQ dual-write gap reproduced with real evidence in
+Phase 2 (Deliberate Test 2, stuck job 4581724a...) and Phase 6
+(Deliberate Test 3, stuck job 7c305a47...).
+
+New table: outbox_events (FK to jobs). createJob and claimReplay now
+write their job change AND an outbox_events row in ONE PostgreSQL
+transaction (via a new withTransaction helper). Neither function calls
+publishJobCreated directly anymore -- the actual RabbitMQ publish is
+performed asynchronously by a new background dispatcher
+(apps/api/src/outbox/dispatcher.ts), which polls for pending outbox
+rows every 2 seconds and publishes them via the EXISTING, UNCHANGED
+publishJobCreated (Phase 2) -- no new message format, no new topology.
+
+The dispatcher runs inside the same API process as Phase 9's
+change-poller, started/stopped identically in index.ts. apps/worker is
+completely unaffected -- consumer.ts, worker's jobService.ts, and the
+RabbitMQ publisher/connection modules are all byte-identical to the
+Phase 9 commit (902d194), confirmed via git diff.
+
+**Explicit limitation, not glossed over:** the outbox guarantees
+durable PUBLICATION intent (a job's need to be published survives any
+crash or RabbitMQ outage), NOT exactly-once DELIVERY. See
+failure-handling.md and engineering-decisions.md.
+
+Verified real via a deliberate RabbitMQ-outage test -- see
+development-log.md for the full walkthrough with real job IDs,
+timestamps, and attempt counts.

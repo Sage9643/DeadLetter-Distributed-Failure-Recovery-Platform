@@ -370,3 +370,146 @@ Discovering this required deliberately breaking the same dependency
 (RabbitMQ) that Phase 0/2's original dual-write test already targeted --
 a second, unplanned finding surfaced by intentionally causing a real
 failure, not by code review.
+
+
+## Deliberate Test 4 -- RabbitMQ outage reproduced and recovered via the outbox
+
+**Date:** 2026-09-16
+
+**Purpose:** Verify the Phase 10 outbox actually closes the dual-write
+gap Phase 2 (Deliberate Test 2) and Phase 6 (Deliberate Test 3) both
+proved was broken, rather than assuming the new code works.
+
+**Procedure:** Stopped RabbitMQ (`docker compose stop rabbitmq`).
+Created a job via real POST /api/jobs (jobId
+b9bb76d4-2ed6-4914-bcf4-4de556167ae4).
+
+**Observed:**
+- Request returned a clean 201 {"status":"QUEUED"} -- NOT the 500
+  IllegalOperationError that the identical scenario produced in Phase
+  2/6, confirming job creation genuinely no longer depends on RabbitMQ
+  being reachable.
+- DB confirmed: status=QUEUED, a real pending outbox_events row
+  (published_at NULL).
+- The dispatcher's real structured logs showed repeated
+  "Outbox dispatch failed; will retry" entries with a real
+  AggregateError (ECONNREFUSED on both ::1:5672 and 127.0.0.1:5672),
+  roughly every 2 seconds -- confirming active, sustained retry, not a
+  stall. attempts climbed from 13 to 45 to 153 across the observation
+  window.
+- Restarted RabbitMQ, confirmed healthy via docker compose ps.
+- Within 2 seconds of the API's next dispatcher tick after RabbitMQ
+  became healthy, the outbox row's published_at was populated
+  (2026-09-16 13:08:19.64682+00) -- fully automatic recovery, zero
+  manual resubmission of the job. attempts correctly remained at 153,
+  preserving the full historical retry count rather than resetting it.
+- (No worker process was running during this test, so the job itself
+  remained status=QUEUED/attempt_count=0 in the jobs table --
+  deliberately isolating what was being tested: publication durability,
+  not worker consumption, which was already proven separately in
+  Phases 3-5.)
+
+**Conclusion:** The exact class of incident reproduced in Phase 2 and
+Phase 6 is now demonstrably closed -- a real job survived a real
+RabbitMQ outage with zero data loss and zero manual intervention.
+
+## Incident 6 -- Leftover duplicate-publish call in the replay route (caught before commit)
+
+**Date:** 2026-09-16
+
+**Expected behavior:** After Phase 10, a successful replay should
+trigger exactly one eventual RabbitMQ publish, via the outbox
+dispatcher only.
+
+**Actual behavior found:** apps/api/src/routes/jobs.ts's replay handler
+still contained the ORIGINAL Phase 6 line, `await
+publishJobCreated(job.id);`, called directly after claimReplay
+succeeded -- even though the Phase 10 version of claimReplay already
+atomically inserts a pending outbox_events row in the same transaction.
+Every successful replay would have triggered the message publish
+TWICE: once synchronously via this leftover call, once asynchronously
+via the dispatcher.
+
+**How it was found:** NOT caught by the full 51-test API suite passing
+-- those tests mock publishJobCreated (jest.mock) and assert only HTTP
+response shape/status codes, never call count. Caught specifically by
+the mandated regression-diff step: `git diff 902d194... --
+apps/api/src/routes/jobs.ts` unexpectedly returned ZERO output,
+revealing that an earlier full-file replacement instruction had never
+actually been applied to disk (a file-editing miss, not a design
+flaw).
+
+**Root cause:** A file replacement given during implementation was
+never applied; the file silently retained its pre-Phase-10 content
+until the regression-diff check surfaced the discrepancy.
+
+**Fix:** Removed the leftover publishJobCreated call and its
+now-inaccurate comment; removed the now-unused import. Verified via a
+direct `type` of the corrected file (confirming no publishJobCreated
+reference remains anywhere in it), then reran the full test suite:
+13 suites / 51 tests still passing after the fix.
+
+**Status:** Caught and fixed during implementation, BEFORE any commit
+-- never shipped. Recorded here per this project's standing discipline
+of documenting real incidents, not only production ones.
+
+**Engineering lesson:** A passing test suite is not sufficient proof
+that a specific behavioral change (here: removing a call site) was
+actually applied -- the mandated diff-against-a-known-commit check
+caught something the tests structurally could not, because the tests
+mocked the exact function whose call COUNT was the actual bug.
+
+## Incident 7 -- AggregateError's empty top-level message masked real dispatch errors
+
+**Date:** 2026-09-16
+
+**Expected behavior:** outbox_events.last_error should contain a
+diagnostically useful message when a dispatch attempt fails.
+
+**Actual behavior:** last_error was recorded as a genuine, confirmed
+non-null EMPTY STRING (verified precisely via
+`last_error IS NULL` = false AND `length(last_error)` = 0, disambiguating
+from a NULL value) despite 153 real, confirmed dispatch failures.
+
+**Root cause:** Node's net module wraps a connection failure that fails
+over both IPv6 (::1) and IPv4 (127.0.0.1) into an AggregateError, whose
+top-level .message property is empty BY DESIGN -- the real per-attempt
+detail lives in its nested .errors array. The dispatcher's original
+catch block did `err.message`, which is correct for ordinary Error
+objects but yields "" for this specific error shape. Confirmed via real
+captured log output showing the full AggregateError with populated
+nested error messages ("connect ECONNREFUSED ::1:5672", "connect
+ECONNREFUSED 127.0.0.1:5672").
+
+**Fix:** dispatcher.ts's catch block now checks
+`err instanceof AggregateError && err.errors.length > 0` and extracts/
+joins the nested messages; falls back to err.message || err.name ||
+String(err) otherwise.
+
+**Verification, precisely stated:** The fix was verified via a clean
+`npx tsc` and the full test suite (13 suites / 51 tests) still passing
+after the change. The corrected last_error TEXT itself was NOT
+re-observed against a fresh live RabbitMQ failure in this session --
+RabbitMQ recovered within seconds of the API restart that loaded the
+fixed code, before another dispatch failure occurred. This gap is
+stated explicitly rather than implied as fully empirically confirmed.
+
+**Related gap, now resolved:** during this same edit, two lines from
+the original specified implementation (`failed += 1;` and a
+`logger.error(...)` call) were not present in the version applied to
+disk. This was an observability/diagnostic correctness issue, not a
+durability failure -- last_error/attempts/claimed_at were correctly
+recorded by markOutboxFailed throughout, which is what actually enables
+recovery. The gap meant only that dispatchOutboxBatch's returned failed
+count stayed at 0 and no structured per-failure log line fired.
+Restored during a Phase 10 corrective pass (see development-log.md):
+`failed += 1` and the structured log call were added back to the
+existing catch block, and one regression test was added asserting both
+the returned count and the underlying DB persistence on a mocked
+publish failure. Final suite result: 63/63 tests passing.
+
+**Engineering lesson:** AggregateError is a real, non-obvious JavaScript
+error shape (produced by Node's own net module for dual-stack
+connection failures) whose default .message is misleading if not
+specifically handled -- worth knowing generally, not just for this
+project.

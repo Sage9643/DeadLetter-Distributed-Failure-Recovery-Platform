@@ -18,5 +18,5 @@ export async function assertTestDatabase(): Promise<void> {
 
 export async function truncateJobs(): Promise<void> {
   await assertTestDatabase();
-  await pool.query("TRUNCATE TABLE jobs;");
+  await pool.query("TRUNCATE TABLE jobs CASCADE;");
 }

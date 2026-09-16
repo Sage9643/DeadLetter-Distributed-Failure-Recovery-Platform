@@ -641,3 +641,78 @@ applied reflexively mid-phase. Flagged as a genuine future task (verify
 vite 8.x/vitest 5.x compatibility with this project's config, then
 upgrade deliberately), not silently ignored or deferred without
 tracking.
+
+
+## Decision: Transactional outbox chosen over a reconciliation-only approach
+
+**Context:** Phase 2's original tracked options for the DB/RabbitMQ
+dual-write gap included a "reconciliation job" (periodically republish
+stale-QUEUED jobs, no new table) alongside the transactional outbox,
+with no decision made at the time.
+
+**Chosen approach:** Transactional outbox (this phase).
+
+**Why, specifically:** A reconciliation-only approach was rejected for
+a concrete, structural reason still true today: a plain QUEUED job with
+NO outbox table is genuinely indistinguishable from "never published"
+vs. "published, just not yet consumed because workers are busy." A
+staleness-only sweep cannot tell these apart without either risking
+false-positive republishes of jobs that were already correctly
+delivered, or accepting an unacceptably long detection delay to be
+safe. An outbox row's binary published_at IS NULL state removes this
+ambiguity entirely -- this is the outbox's specific, structural
+advantage over reconciliation-only, not a default/conventional choice.
+
+**Trade-off:** A new table, a new background poller (mirroring the
+already-established Phase 9 change-poller pattern, so no new
+architectural shape). No new infrastructure/service required.
+
+## Decision: Job/outbox transaction boundary excludes the RabbitMQ publish itself
+
+**Context:** Where should the transaction boundary sit -- around just
+the DB writes, or held open through the RabbitMQ publish too?
+
+**Chosen approach:** The transaction covers ONLY the job write + the
+outbox_events insert. The RabbitMQ publish happens later, in the
+dispatcher, entirely outside any open PostgreSQL transaction.
+
+**Why:** Holding a DB transaction open across a network call to
+RabbitMQ would mean a slow or hanging RabbitMQ directly stalls a
+PostgreSQL connection/lock for an unbounded time -- a real production
+risk (connection pool exhaustion under sustained RabbitMQ slowness),
+not a hypothetical one. Separating them means the DB write commits fast
+regardless of RabbitMQ's state, and the API's response time to the
+client no longer depends on RabbitMQ being reachable at all -- proven
+real during the deliberate outage test (POST /api/jobs returned a clean
+201 with RabbitMQ fully down).
+
+**Trade-off:** This is precisely what makes the outbox NOT
+exactly-once (see failure-handling.md) -- the publish and the
+"mark published" write are two separate operations with their own
+(much smaller, still real) gap. Accepted, and structurally unavoidable
+without holding a lock across network I/O, which was rejected as worse.
+
+## Decision: Dispatcher claim uses SKIP LOCKED, not an application-level mutex
+
+**Context:** How should concurrent dispatcher instances (relevant if
+the API is ever horizontally scaled) avoid claiming and double-
+publishing the same outbox row?
+
+**Chosen approach:** `UPDATE ... WHERE id IN (SELECT ... FOR UPDATE
+SKIP LOCKED) RETURNING *` -- a single atomic SQL statement, the same
+pattern family as Phase 5's claimJob and Phase 6's claimReplay.
+
+**Why:** FOR UPDATE SKIP LOCKED is PostgreSQL's native mechanism for
+exactly this "multiple workers competing for a queue of rows" pattern
+-- any concurrent claim attempt against an already-locked row is
+skipped rather than blocked, so two dispatchers can never both receive
+the same row, with zero new infrastructure (no Redis lock, no
+application-level mutex). Verified real via a genuine PostgreSQL
+concurrency test (Promise.all against real deadletter_test, same
+evidentiary standard as Phase 5/6's claim concurrency tests): two
+concurrent claim calls against 4 pending rows never returned
+overlapping IDs.
+
+**Trade-off:** None significant at this project's current scale (single
+API process). The mechanism is correct regardless of whether horizontal
+scaling is ever introduced later.

@@ -274,3 +274,35 @@ UPDATE) did not affect the staleness-reclaim branch.
   sequential manual commands could observe. This is an observational
   limitation of manual testing, not a claim that the state doesn't
   exist or behaves incorrectly.
+
+
+
+## Phase 10 -- Transactional Outbox: Durable Publication, Explicitly NOT Exactly-Once
+
+**The outbox guarantees:** a job's need to be published to RabbitMQ is
+recorded durably, atomically, alongside the job's own state change. A
+crash, an API restart, or a RabbitMQ outage at any point can no longer
+silently lose that need -- the pending outbox row survives and will be
+retried indefinitely until it succeeds.
+
+**The outbox does NOT guarantee exactly-once delivery.** If
+publishJobCreated succeeds but the dispatcher process crashes before
+markOutboxPublished commits, the row remains claimed, is later
+reclaimed as stale (30-second threshold, mirroring Phase 5's
+STALE_PROCESSING_THRESHOLD_SECONDS pattern), and WILL be published
+again on a subsequent attempt -- a genuine duplicate message reaching
+RabbitMQ. This was deliberately reproduced and proven real (not
+theoretical) via a controlled simulation in
+apps/api/src/__tests__/integration/dispatcher.test.ts: claim a row,
+publish it for real, deliberately skip markOutboxPublished (simulating
+a crash), backdate claimed_at past the staleness threshold, and observe
+the dispatcher genuinely republish it.
+
+**Duplicate-delivery protection remains entirely the worker's
+responsibility, unchanged from Phase 5.** claimJob's atomic conditional
+UPDATE (proven under a genuine concurrent race in Phase 5's Test 4) is
+what ensures at most one execution of processJob() per logical attempt,
+regardless of how many times the same jobId is delivered. The outbox
+does not change, weaken, or duplicate this protection -- it is a
+completely separate mechanism operating at a different layer (API
+publication vs. worker consumption).

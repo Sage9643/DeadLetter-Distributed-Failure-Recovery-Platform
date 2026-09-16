@@ -18,5 +18,8 @@ export async function assertTestDatabase(): Promise<void> {
 
 export async function truncateJobs(): Promise<void> {
   await assertTestDatabase();
-  await pool.query("TRUNCATE TABLE jobs;");
+  // Phase 10: CASCADE required now that outbox_events has a FK to
+  // jobs(id). This also means any future table referencing jobs is
+  // automatically truncated here too, with no further edit needed.
+  await pool.query("TRUNCATE TABLE jobs CASCADE;");
 }

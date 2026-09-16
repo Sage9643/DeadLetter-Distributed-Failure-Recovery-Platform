@@ -28,6 +28,7 @@ describe("App", () => {
               byStatus: { QUEUED: 1, PROCESSING: 0, RETRYING: 0, COMPLETED: 4, DEAD_LETTERED: 0, FAILED: 0 },
               totalReplays: 0,
               totalAttempts: 9,
+	      pendingOutboxEvents: 2,
             }),
         } as Response);
       }
@@ -42,9 +43,10 @@ describe("App", () => {
     await waitFor(() => {
       expect(screen.getByText("DeadLetter Operational Dashboard")).toBeInTheDocument();
     });
-    await waitFor(() => {
-      expect(screen.getByText("5")).toBeInTheDocument();
+        await waitFor(() => {
+      expect(screen.getByText("Total Jobs")).toBeInTheDocument();
     });
+    expect(screen.getAllByText("5")).toHaveLength(1);
     expect(screen.getByText("No jobs yet.")).toBeInTheDocument();
   });
 

@@ -208,3 +208,43 @@ There is NO job_attempts table. Therefore:
   last_dead_lettered_at UPDATED to the second (most recent) exhaustion
   timestamp -- directly demonstrates the "most recent event only"
   semantics
+
+
+## Phase 10 update -- outbox_events table
+
+Migration: infra/init-db/003_phase10_outbox_table.sql
+
+```sql
+CREATE TABLE outbox_events (
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    job_id       UUID NOT NULL REFERENCES jobs(id),
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at   TIMESTAMPTZ NULL,
+    published_at TIMESTAMPTZ NULL,
+    attempts     INT NOT NULL DEFAULT 0,
+    last_error   TEXT NULL
+);
+
+CREATE INDEX idx_outbox_pending ON outbox_events (created_at)
+    WHERE published_at IS NULL;
+```
+
+- FK to jobs(id) -- REQUIRED both testDb.ts helpers (api and worker) to
+  change TRUNCATE TABLE jobs to TRUNCATE TABLE jobs CASCADE, since
+  Postgres refuses to truncate a table referenced by another table's FK
+  otherwise. This affects the worker's test helper even though the
+  worker never touches outbox_events directly, because both apps share
+  the same deadletter_test schema.
+- Partial index (WHERE published_at IS NULL) -- only pending rows are
+  ever queried by the dispatcher's claim statement; published rows
+  accumulate but are never scanned by this index.
+- No event_type/routing_key column -- every current outbox event is
+  always "job.created" to the same exchange/routing key; hardcoded in
+  the dispatcher rather than stored, since it currently only ever holds
+  one constant value. A second event type later would need a small
+  migration -- an accepted trade-off, not a preemptive one.
+- No payload column -- the message is always exactly {"jobId": job_id},
+  fully derivable from job_id alone.
+- Cleanup deliberately deferred -- published rows accumulate
+  indefinitely, consistent with this project's existing accepted
+  pattern (DLQ messages, historical FAILED rows also never cleaned up).

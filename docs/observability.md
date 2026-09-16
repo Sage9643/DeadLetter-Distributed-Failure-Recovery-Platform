@@ -252,3 +252,37 @@ before this report.
   REST API, which also has none)
 - Incident 5 (RabbitMQ channel non-recovery) and the DB/RabbitMQ
   dual-write gap remain unrelated to and unaffected by this phase
+
+
+## Phase 10 -- pendingOutboxEvents as an operational signal
+
+GET /api/stats now includes pendingOutboxEvents. Interpretation:
+
+- A small, transient non-zero count is NORMAL -- it reflects rows
+  claimed-but-not-yet-published or freshly-inserted rows awaiting the
+  next 2-second dispatcher tick.
+- A SUSTAINED or GROWING count is a real operational signal that the
+  dispatcher cannot currently reach RabbitMQ (or RabbitMQ is down) --
+  directly analogous to watching Ready count grow on a RabbitMQ queue,
+  but sourced entirely from PostgreSQL, requiring no RabbitMQ
+  management API coupling (consistent with the reasoning already
+  documented in Phase 8/9 for why /api/stats never queries RabbitMQ
+  directly).
+- This metric was proven meaningful with real data during Phase 10's
+  deliberate RabbitMQ-outage test: a single stuck job's outbox row
+  remained pending through 153 real, logged dispatch failures before
+  RabbitMQ recovery. See development-log.md for the full walkthrough.
+
+## Known gap, honestly documented
+
+dispatchOutboxBatch's returned `failed` count is currently always 0
+even on real dispatch failures, and no structured
+"Outbox dispatch failed" log line currently fires on the failure path
+-- both were present in the originally specified implementation but
+were dropped during a file edit and not restored (see
+incidents-and-failures.md). This does NOT affect the outbox's actual
+durability guarantee: last_error, attempts, and claimed_at are still
+correctly written by markOutboxFailed on every failure, which is what
+enables recovery. It DOES mean per-tick failure visibility in logs is
+currently reduced compared to the original design. Flagged as a real,
+minor, accepted gap for a future small fix, not silently hidden.

@@ -230,3 +230,31 @@ and the PostgreSQL polling design (including startup cursor strategy).
 Verified real: a genuine WebSocket server + real client connection over
 a real ephemeral local port, asserting the client actually receives a
 broadcast event matching the exact contract above.
+
+
+## GET /api/stats -- updated (Phase 10)
+
+Added one field, `pendingOutboxEvents` -- count of outbox_events rows
+with published_at IS NULL (durable work not yet successfully published
+to RabbitMQ). Computed via a scalar subquery in the same single
+aggregate SELECT already used for every other stats field -- still one
+query, one round trip.
+
+```json
+{
+  "totalJobs": 123,
+  "byStatus": { "...": "..." },
+  "totalReplays": 12,
+  "totalAttempts": 245,
+  "pendingOutboxEvents": 0
+}
+```
+
+## POST /api/jobs/:id/replay -- updated (Phase 10)
+
+Response shape and status codes (200/404/409/400) are UNCHANGED. The
+internal mechanism changed: the route handler no longer calls
+publishJobCreated directly. claimReplay now atomically writes the
+DEAD_LETTERED->QUEUED transition and a pending outbox_events row in one
+transaction; the actual RabbitMQ publish happens asynchronously via the
+outbox dispatcher. See architecture.md and engineering-decisions.md.

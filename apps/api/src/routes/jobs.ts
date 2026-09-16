@@ -1,7 +1,6 @@
 import { Router } from "express";
 import { createJobSchema, jobIdParamSchema } from "../validation/jobSchema";
 import { createJob, getJobById, claimReplay, listRecentJobs } from "../services/jobService";
-import { publishJobCreated } from "../queue/publisher";
 import { env } from "../config/env";
 
 export const jobsRouter = Router();
@@ -88,13 +87,14 @@ jobsRouter.post("/:id/replay", async (req, res) => {
     });
   }
 
-  log.info({ replayCount: job.replay_count }, "Replay claim succeeded, publishing job.created message");
+   log.info({ replayCount: job.replay_count }, "Replay claim succeeded; outbox event recorded for dispatch");
 
-  // Same dual-write risk already tracked since Phase 0/2: if the DB
-  // update above succeeded but this publish fails, the job remains
-  // QUEUED with no message ever sent. Not solved here -- see
-  // engineering-decisions.md.
-  await publishJobCreated(job.id);
+  // Phase 10: the DEAD_LETTERED->QUEUED update and its outbox event
+  // were committed atomically inside claimReplay (see jobService.ts).
+  // The actual RabbitMQ publish is now performed asynchronously by the
+  // outbox dispatcher, closing the dual-write gap previously tracked
+  // here since Phase 0/2/6. See engineering-decisions.md -- this does
+  // NOT provide exactly-once delivery, only durable publication intent.
 
   res.status(200).json({
     jobId: job.id,

@@ -5,6 +5,7 @@ export interface JobStats {
   byStatus: Record<string, number>;
   totalReplays: number;
   totalAttempts: number;
+  pendingOutboxEvents: number;
 }
 
 // Single aggregate query, one round trip. Postgres COUNT/SUM return
@@ -14,6 +15,12 @@ export interface JobStats {
 // since Phase 4 (superseded by RETRYING/DEAD_LETTERED), but real
 // historical rows from Phases 3 still exist and a stats endpoint that
 // silently dropped them would misrepresent total job counts.
+//
+// Phase 10: pendingOutboxEvents added via a scalar subquery in the same
+// SELECT -- still one query, one round trip, per the approved design.
+// Represents outbox_events rows with published_at IS NULL: durable
+// work the dispatcher has not yet (or not successfully) published to
+// RabbitMQ. See docs/observability.md.
 export async function getStats(): Promise<JobStats> {
   const result = await pool.query<{
     total_jobs: string;
@@ -25,6 +32,7 @@ export async function getStats(): Promise<JobStats> {
     dead_lettered: string;
     total_replays: string;
     total_attempts: string;
+    pending_outbox_events: string;
   }>(
     `SELECT
        COUNT(*) AS total_jobs,
@@ -35,14 +43,13 @@ export async function getStats(): Promise<JobStats> {
        COUNT(*) FILTER (WHERE status = 'RETRYING') AS retrying,
        COUNT(*) FILTER (WHERE status = 'DEAD_LETTERED') AS dead_lettered,
        COALESCE(SUM(replay_count), 0) AS total_replays,
-       COALESCE(SUM(total_attempt_count), 0) AS total_attempts
+       COALESCE(SUM(total_attempt_count), 0) AS total_attempts,
+       (SELECT COUNT(*) FROM outbox_events WHERE published_at IS NULL) AS pending_outbox_events
      FROM jobs`
   );
 
   const row = result.rows[0];
   if (!row) {
-    // Defensive only: aggregate queries with no GROUP BY always return
-    // exactly one row, even against an empty table.
     throw new Error("getStats: no row returned from aggregate query");
   }
 
@@ -58,5 +65,6 @@ export async function getStats(): Promise<JobStats> {
     },
     totalReplays: Number(row.total_replays),
     totalAttempts: Number(row.total_attempts),
+    pendingOutboxEvents: Number(row.pending_outbox_events),
   };
 }

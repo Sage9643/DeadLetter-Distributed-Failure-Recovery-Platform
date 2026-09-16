@@ -1308,3 +1308,209 @@ notifications built on the existing PostgreSQL-as-source-of-truth
 architecture rather than new infrastructure.
 
 ### Real test results
+apps/api: 10 suites / 38 tests -- PASS
+apps/worker: 2 suites / 11 tests -- PASS
+apps/dashboard: 5 suites / 13 tests -- PASS
+
+Total: 17 suites, 62 tests, 0 failures. apps/dashboard build: clean (37
+modules, no errors).
+
+### Real incidents encountered and resolved
+1. **File-creation copy/paste corruption.** A terminal command
+   (`notepad apps\api\src\routes\jobs.ts`) got literally typed into the
+   file content instead of run separately, corrupting the first two
+   import lines with 21 resulting compile errors. Caught via `npx tsc`
+   output, fixed via a full verified-clean file replacement.
+2. **Missing vite/client ambient types.** `import "./styles.css"` failed
+   type-checking (TS2882) because tsconfig.json's `types` array didn't
+   include `vite/client`. Fixed by adding it; verified via a clean
+   `npx tsc -b --noEmit` and successful `npm run build`.
+3. **Ambiguous test fixture.** App.test.tsx used totalJobs=5 and
+   totalAttempts=5 simultaneously, causing `getByText("5")` to
+   correctly fail on finding two matching elements (a real test bug,
+   not a component bug -- the component rendered correctly). Fixed by
+   using distinct fixture values.
+4. **Stray shell-redirect artifact files.** Two small files (`e HEAD`,
+   `tatus`) appeared as untracked in git status -- confirmed to be
+   accidental output-redirection artifacts from earlier terminal
+   commands (containing literal `git log`/`git status` output), not
+   real project files. Deleted.
+5. **Uncommitted build artifact.** `apps/dashboard/tsconfig.tsbuildinfo`
+   (tsc's incremental-build cache) appeared as untracked. Added
+   `*.tsbuildinfo` to the root .gitignore rather than deleting it once,
+   preventing recurrence on future builds.
+6. **React act() warnings** in useJobEvents.test.ts (non-failing, but
+   noisy) -- mock WebSocket event dispatches happened outside React's
+   batching. Fixed by wrapping them in `act()`.
+
+None of these incidents involved application/business logic -- all were
+scaffolding, tooling, or test-authoring issues, caught and resolved
+before this report.
+
+### Regression verification against commit 7ae6feea35c658196514dfc7f50c4e913ccbe1c0
+- apps/worker/src/consumer.ts: absent from diff -- UNCHANGED
+- apps/worker/src/services/jobService.ts: absent from diff -- UNCHANGED
+- apps/api/src/app.ts: absent from diff -- UNCHANGED (by design --
+  see engineering-decisions.md)
+- apps/api/src/services/jobService.ts: diff shows ONLY the new
+  listRecentJobs function inserted; createJob/getJobById/claimReplay
+  unchanged
+- apps/api/src/routes/jobs.ts: diff shows ONLY the new GET / handler
+  inserted; POST /, GET /:id, POST /:id/replay unchanged
+- No migration files added
+- claimJob, claimReplay, retry/backoff, DLQ, ACK/NACK, replay semantics:
+  all confirmed unchanged by the above
+
+### Known limitations (honest, not hidden)
+- Near-real-time only (2s poll bound), not instant push
+- No index on jobs.updated_at supporting the poller query yet
+- 5 npm audit findings in apps/dashboard's dev-tooling
+  (vitest/vite/esbuild) investigated and accepted as dev-server-only
+  exposures, not force-upgraded this phase -- see
+  engineering-decisions.md
+- Dashboard not containerized (consistent with apps/api and
+  apps/worker's current state)
+- No authentication on the WebSocket endpoint (consistent with the
+  REST API, which also has none)
+- Incident 5 (RabbitMQ channel non-recovery) and the DB/RabbitMQ
+  dual-write gap remain unrelated to and unaffected by this phase
+
+
+## Phase 10 -- Transactional Outbox: Real Results
+
+**Date:** 2026-09-16
+
+### What we built
+- infra/init-db/003_phase10_outbox_table.sql -- outbox_events table,
+  FK to jobs, partial index on pending rows
+- apps/api/src/db/withTransaction.ts -- generic BEGIN/COMMIT/ROLLBACK
+  wrapper
+- apps/api/src/outbox/outboxService.ts -- insertOutboxEvent,
+  claimPendingOutboxEvents (SKIP LOCKED + staleness reclaim),
+  markOutboxPublished, markOutboxFailed, countPendingOutboxEvents
+- apps/api/src/outbox/dispatcher.ts -- 2s poll interval, batch size 10,
+  publishes via the existing unchanged publishJobCreated
+- createJob and claimReplay (apps/api/src/services/jobService.ts)
+  rewritten to write their job change + an outbox event in one
+  transaction; neither calls publishJobCreated directly anymore
+- apps/api/src/services/statsService.ts -- added pendingOutboxEvents
+- apps/api/src/index.ts -- starts/stops the dispatcher alongside the
+  existing Phase 9 change-poller
+- Both apps' testDb.ts helpers updated (TRUNCATE ... CASCADE, required
+  by the new FK)
+- apps/dashboard: Overview.tsx / client.ts / their tests updated for
+  the new stats field
+
+### Why
+Closes the DB/RabbitMQ dual-write gap reproduced with real evidence in
+Phase 2 and Phase 6.
+
+### Real test results (final, verified)
+apps/api: 13 suites / 51 tests -- PASS
+apps/worker: 2 suites / 11 tests -- PASS
+Total: 15 suites / 62 tests -- PASS, 0 failures
+
+
+### Real deliberate test: RabbitMQ outage and automatic recovery
+Full detail in incidents-and-failures.md, Deliberate Test 4. Summary: a
+real job (b9bb76d4-2ed6-4914-bcf4-4de556167ae4) was created successfully
+via POST /api/jobs while RabbitMQ was stopped (clean 201, not the 500
+Phase 2/6 produced under the same condition). The dispatcher retried
+every ~2s, real attempts climbing 13 -> 45 -> 153 across the
+observation window, each with a real logged AggregateError. Once
+RabbitMQ was restarted and confirmed healthy, the very next dispatcher
+tick (within 2 seconds) published the message and recorded
+published_at, with zero manual intervention and the full historical
+attempts count preserved.
+
+### Real incidents found and fixed during implementation (both BEFORE commit)
+1. **Duplicate-publish bug** (Incident 6) -- a leftover Phase 6 publish
+   call in the replay route, caught by the mandated regression-diff
+   check (not by the passing test suite, which mocks the exact function
+   whose call count was the bug). Fixed; 51/51 tests still passing
+   afterward.
+2. **AggregateError empty-message bug** (Incident 7) -- last_error was
+   recorded as a confirmed-empty string (not NULL) on 153 real dispatch
+   failures, because Node's AggregateError has an empty top-level
+   .message by design. Fixed by extracting the nested .errors detail.
+   The corrected message text was not re-observed against a fresh live
+   failure in this session (RabbitMQ recovered too quickly) -- verified
+   via code review, clean build, and full test suite pass instead.
+
+### Real file-editing incidents encountered (process issues, not application bugs)
+- A terminal command got literally typed into apps/api/src/routes/jobs.ts
+  during an earlier edit, corrupting its import lines (21 resulting
+  compile errors) -- caught via npx tsc, fixed via a verified full
+  replacement.
+- apps/worker/src/__tests__/helpers/testDb.ts was twice overwritten with
+  the WRONG content (the API's outboxService.test.ts content pasted in
+  by mistake, including once in a visibly corrupted/truncated state) --
+  caught via `Cannot find module '../../outbox/outboxService'` at test
+  run time (the worker has no such module), fixed by direct
+  reconstruction and verified via `type` + `dir` (file size check)
+  before rerunning tests.
+- A stray shell-redirect artifact file ("e HEAD", containing literal
+  git log output) reappeared during this phase -- same class of
+  accident as Phase 9's "e HEAD"/"tatus" files -- found via git status,
+  confirmed harmless via type, deleted.
+- Document/file-upload attachments were unreliable for sharing terminal
+  output during this phase's session (repeatedly arrived empty) --
+  worked around by having all real command output pasted as plain text
+  directly in chat instead, which is the standard this project has used
+  throughout regardless.
+
+None of these file-editing incidents involved application/business
+logic corruption that reached a passing test suite undetected, except
+Incident 6, which is exactly why the mandated diff-against-commit
+regression step exists and was followed rigorously.
+
+### Regression verification against commit 902d194d1979061429ff9bbceb5d3d4414abfade
+- apps/worker/src/consumer.ts: confirmed UNCHANGED (zero-output diff)
+- apps/worker/src/services/jobService.ts: confirmed UNCHANGED
+- apps/api/src/app.ts: confirmed UNCHANGED
+- apps/api/src/queue/publisher.ts: confirmed UNCHANGED
+- apps/api/src/queue/connection.ts: confirmed UNCHANGED
+- apps/api/src/services/jobService.ts: diff reviewed line-by-line --
+  confirmed to contain ONLY the withTransaction wrapping,
+  insertOutboxEvent calls replacing the old publishJobCreated calls,
+  and the associated re-indentation; getJobById and listRecentJobs
+  pass through completely untouched; both SQL statements (INSERT,
+  UPDATE) byte-identical to their pre-Phase-10 form
+
+### Known limitations (honest, not hidden)
+- NOT exactly-once delivery -- see failure-handling.md
+- dispatchOutboxBatch's failed count and per-failure log line --
+  currently non-functional (Incident 7's related gap), does not affect
+  actual durability/recovery
+- Outbox table grows unbounded -- cleanup deliberately deferred,
+  consistent with existing DLQ/FAILED-row precedent
+- No horizontal API scaling exists today to actually exercise the
+  SKIP LOCKED multi-dispatcher scenario in production -- proven correct
+  via a real concurrency test instead
+- Incident 5 (RabbitMQ channel non-recovery, Phase 6) remains
+  unrelated to and unaffected by this phase
+
+
+## Phase 10 -- Corrective Pass: Dispatcher Failure Accounting/Logging Restored
+
+During final verification, it was confirmed that dispatchOutboxBatch's
+failure accounting and logging had been accidentally dropped during an
+earlier editing step in this phase: the returned `failed` counter was
+never incremented, and no structured log line fired on a dispatch
+failure. This was detected during the final verification pass, not
+found by the existing test suite (no test asserted on the failed count
+or the log line).
+
+Fix: restored `failed += 1` and the structured
+`logger.error({ err, outboxId, jobId }, "Outbox dispatch failed; will
+retry")` call inside dispatcher.ts's existing catch block. One
+regression test was added (dispatcher.test.ts) asserting both the
+returned failed count and the underlying markOutboxFailed persistence
+(attempts/last_error/claimed_at) on a mocked publish failure.
+
+No application logic outside dispatcher.ts and its test file was
+modified during this corrective pass -- confirmed via diff against the
+Phase 9 commit for consumer.ts, worker's jobService.ts, app.ts,
+publisher.ts, and connection.ts (all unchanged).
+
+Final result: 63/63 tests passing (62 prior + 1 new regression test).

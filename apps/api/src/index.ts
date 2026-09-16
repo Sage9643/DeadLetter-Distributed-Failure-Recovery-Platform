@@ -6,15 +6,8 @@ import { pool } from "./db/pool";
 import { logger } from "./logger";
 import { Broadcaster } from "./ws/broadcaster";
 import { startChangePoller, ChangePollerHandle } from "./ws/changePoller";
+import { startOutboxDispatcher, DispatcherHandle } from "./outbox/dispatcher";
 
-// Phase 9: the HTTP server is now created explicitly (rather than via
-// app.listen()) so the WebSocket server can attach to the SAME
-// underlying server/port -- no second port, no new infrastructure.
-// app.ts itself is deliberately NOT touched: it remains a pure
-// route-registration module with no side effects, so the 27+ existing
-// tests that import `app` via supertest are structurally unaffected --
-// supertest creates its own ephemeral server around the plain Express
-// app regardless of what index.ts does.
 const server = http.createServer(app);
 
 const wss = new WebSocketServer({ server, path: "/ws" });
@@ -28,6 +21,7 @@ wss.on("connection", (ws) => {
 });
 
 let pollerHandle: ChangePollerHandle | null = null;
+let outboxDispatcherHandle: DispatcherHandle | null = null;
 let shuttingDown = false;
 
 async function shutdown(signal: string): Promise<void> {
@@ -35,6 +29,7 @@ async function shutdown(signal: string): Promise<void> {
   shuttingDown = true;
   logger.info({ signal }, "API shutting down");
   pollerHandle?.stop();
+  outboxDispatcherHandle?.stop();
   wss.close();
   server.close();
   try {
@@ -64,3 +59,5 @@ startChangePoller(pool, broadcaster)
   .catch((err) => {
     logger.error({ err }, "Failed to start change poller");
   });
+
+outboxDispatcherHandle = startOutboxDispatcher(pool);

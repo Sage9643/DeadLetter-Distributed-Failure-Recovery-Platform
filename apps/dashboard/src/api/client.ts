@@ -3,6 +3,7 @@ export interface Stats {
   byStatus: Record<string, number>;
   totalReplays: number;
   totalAttempts: number;
+  pendingOutboxEvents: number;
 }
 
 export interface RecentJob {

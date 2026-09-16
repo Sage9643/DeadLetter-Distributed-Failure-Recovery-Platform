@@ -1,6 +1,7 @@
-import { publishJobCreated } from "../queue/publisher";
 import { pool } from "../db/pool";
 import { CreateJobInput } from "../validation/jobSchema";
+import { withTransaction } from "../db/withTransaction";
+import { insertOutboxEvent } from "../outbox/outboxService";
 
 export interface Job {
   id: string;
@@ -18,22 +19,32 @@ export interface Job {
   last_dead_letter_reason: string | null;
 }
 
+// Phase 10: job insertion and its outbox event are now written in ONE
+// PostgreSQL transaction. This closes the dual-write gap reproduced in
+// Phase 2 (Deliberate Test 2) -- a job can no longer exist in Postgres
+// without a durable record that a RabbitMQ message still needs to be
+// published. The RabbitMQ publish itself no longer happens here at
+// all; it is performed asynchronously by the outbox dispatcher (see
+// apps/api/src/outbox/dispatcher.ts). See engineering-decisions.md --
+// this does NOT provide exactly-once delivery.
 export async function createJob(input: CreateJobInput): Promise<Job> {
-  const result = await pool.query<Job>(
-    `INSERT INTO jobs (type, payload)
-     VALUES ($1, $2)
-     RETURNING *`,
-    [input.type, input.payload]
-  );
+  return withTransaction(async (client) => {
+    const result = await client.query<Job>(
+      `INSERT INTO jobs (type, payload)
+       VALUES ($1, $2)
+       RETURNING *`,
+      [input.type, input.payload]
+    );
 
-  const job = result.rows[0];
-  if (!job) {
-    throw new Error("Failed to create job: no row returned from INSERT");
-  }
+    const job = result.rows[0];
+    if (!job) {
+      throw new Error("Failed to create job: no row returned from INSERT");
+    }
 
-  await publishJobCreated(job.id);
+    await insertOutboxEvent(client, job.id);
 
-  return job;
+    return job;
+  });
 }
 
 export async function getJobById(id: string): Promise<Job | null> {
@@ -44,6 +55,7 @@ export async function getJobById(id: string): Promise<Job | null> {
 
   return result.rows[0] ?? null;
 }
+
 export interface RecentJob {
   id: string;
   type: string;
@@ -86,18 +98,35 @@ export async function listRecentJobs(): Promise<RecentJob[]> {
 // (it only increments on actual worker claims, in worker/jobService.ts).
 // last_dead_lettered_at/last_dead_letter_reason are NOT touched --
 // deliberately preserved indefinitely.
+//
+// Phase 10: the conditional UPDATE and its outbox event insertion now
+// happen in ONE transaction, closing the same dual-write gap reproduced
+// in Phase 6 (Deliberate Test 3) for the replay path specifically. If
+// the UPDATE matches zero rows (lost a race, already terminal, or not
+// DEAD_LETTERED), NO outbox event is inserted -- claimReplay's exact
+// existing conditional semantics are fully preserved.
 export async function claimReplay(id: string): Promise<Job | null> {
-  const result = await pool.query<Job>(
-    `UPDATE jobs
-     SET status = 'QUEUED',
-         attempt_count = 0,
-         replay_count = replay_count + 1,
-         last_error = NULL,
-         updated_at = now()
-     WHERE id = $1
-       AND status = 'DEAD_LETTERED'
-     RETURNING *`,
-    [id]
-  );
-  return result.rows[0] ?? null;
+  return withTransaction(async (client) => {
+    const result = await client.query<Job>(
+      `UPDATE jobs
+       SET status = 'QUEUED',
+           attempt_count = 0,
+           replay_count = replay_count + 1,
+           last_error = NULL,
+           updated_at = now()
+       WHERE id = $1
+         AND status = 'DEAD_LETTERED'
+       RETURNING *`,
+      [id]
+    );
+
+    const job = result.rows[0];
+    if (!job) {
+      return null;
+    }
+
+    await insertOutboxEvent(client, job.id);
+
+    return job;
+  });
 }
