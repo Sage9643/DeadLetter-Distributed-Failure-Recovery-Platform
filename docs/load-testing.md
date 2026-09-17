@@ -341,6 +341,134 @@ design or by circumstance.
   proof).
 
 
+
+## Scenario E -- Replay Under Concurrency
+
+Purpose: seed a fixed number of DEAD_LETTERED jobs directly via SQL,
+then fire concurrent POST /:id/replay requests deliberately targeting
+the SAME job IDs from multiple iterations, and verify -- via
+PostgreSQL directly -- that claimReplay's existing atomic conditional
+UPDATE (Phase 6, unmodified) allows at most one successful claim per
+job, corroborating the single-job proof from Phase 6's Deliberate Test
+5 at real k6-generated concurrent volume.
+
+Configuration (actual, as executed, after a harness fix -- see
+Real incident below):
+- 20 jobs seeded directly via SQL (tests/load/verify/seedReplayJobs.js)
+  as DEAD_LETTERED, attempt_count=max_attempts=5, replay_count=0, with
+  populated last_dead_lettered_at/last_dead_letter_reason -- the exact
+  terminal state the real retry pipeline (Scenario C, Phases 4-6)
+  produces, seeded directly to isolate replay-claim correctness from
+  DLQ-arrival correctness (already separately proven)
+- k6 executor: shared-iterations, 10 VUs, 40 total iterations
+  (exactly 2x the seeded job count)
+- Deterministic, guaranteed ID reuse: iteration index (via
+  exec.scenario.iterationInTest, a genuinely global counter -- see
+  incident below) modulo 20 -- every seeded job ID is targeted by
+  EXACTLY 2 separate iterations, guaranteeing a real claim race on
+  every single job by construction, not by chance
+- k6 script targets ONLY POST /api/jobs/:id/replay -- does not call
+  POST /api/jobs at all
+
+## Real incident during Scenario E: k6 __ITER is per-VU, not global
+
+**First run result (invalidated, re-run required):** an initial run
+used `__ITER` (k6's built-in per-VU iteration counter) to select which
+job ID each iteration targeted. Per k6's own documentation and a
+directly matching community example, `__ITER` restarts at 0
+independently for EACH VU in shared-iterations mode -- it is not a
+single sequential counter shared across all VUs. This caused most of
+the 40 iterations to redundantly target only the first 5 seeded job
+IDs (whichever low index values multiple VUs' independently-restarting
+counters happened to reach), while the remaining 15 seeded jobs were
+NEVER requested at all. Confirmed via real evidence, not assumed: the
+15 untouched jobs' updated_at timestamps matched their original seed
+time exactly, while the 5 claimed jobs' timestamps were ~1 minute
+later, and only the lowest-index 5 job IDs (in seed-array order) were
+ever claimed.
+
+This was a bug in the TEST HARNESS script's ID-selection logic only --
+claimReplay, the outbox, and worker claiming were not involved and
+were not modified. The atomicity invariant (replay_count never
+exceeding 1) held correctly even in this flawed first run, for every
+job that WAS actually targeted -- the flaw was incomplete coverage,
+not incorrect claiming behavior.
+
+**Fix:** replaced `__ITER` with `exec.scenario.iterationInTest` (from
+the k6/execution module) -- k6's documented mechanism for a genuinely
+global, monotonically-increasing iteration counter across all VUs in
+shared-iterations mode, which is what guaranteed per-job coverage
+actually requires. Re-ran the full scenario (fresh reset, fresh seed,
+fresh 20 UUIDs) after the fix -- see results below.
+
+k6-reported results (real, from the corrected re-run):
+- 40 iterations / HTTP requests
+- 100.00% checks succeeded (40 / 40 -- our check accepts BOTH 200 and
+  409 as expected, valid outcomes per the real, documented replay
+  route contract)
+- http_req_failed: 50.00% (20 out of 40) -- this EXACTLY matches the
+  predicted 20-winner/20-loser split now that every job received
+  genuine 2-way contention, confirming the harness fix worked
+  completely (k6's http_req_failed metric counts any non-2xx/3xx
+  response as "failed" by default, with no awareness of our custom
+  check logic -- the 409s it counts here are the correct, expected
+  lost-race outcome, not real failures)
+- http_req_duration: avg 47.63ms, min 15.26ms, med 33.53ms, max
+  142.44ms, p90 100.86ms, p95 123.45ms
+
+PostgreSQL-verified results (the authoritative pass/fail source, via
+node tests/load/verify/verifyDb.js replay):
+- Exactly 20 job rows found with type = load_test_replay
+- 0 jobs with replay_count > 1 -- the core invariant, holding across
+  all 20 genuine concurrent races
+- All 20 jobs show replay_count = 1 (every single seeded job was
+  successfully claimed by exactly one of its 2 competing requests)
+- Of those, 0 failed to reach a legitimate terminal state -- all 20
+  reached COMPLETED
+- 0 pending outbox events remaining for these jobs
+- 0 claimed jobs with an inconsistent attempt_count
+- Script exited 0, printed PASS
+
+Independent SQL cross-check (GROUP BY status, replay_count):
+COMPLETED | replay_count=1 | count=20
+A single, clean row -- no other status or replay_count value exists
+anywhere in the seeded set.
+
+## Explicit scope of the Scenario E result
+
+This result validates the system's behavior under this particular
+small, fixed-volume local workload (20 seeded jobs, 40 concurrent
+replay requests guaranteeing 2-way contention on every job) and
+corroborates, at real k6-generated concurrent HTTP volume, the same
+atomic-replay-claim guarantee Phase 6's Deliberate Test 5 first proved
+with a single job by hand. It is NOT a general scalability claim -- no
+conclusion is drawn about behavior with a much larger number of
+simultaneously-raced jobs or higher contention factors than 2-way. It
+does NOT prove or claim exactly-once delivery or exactly-once
+processing -- only exactly-one-successful-replay-claim per job, which
+is the real, narrower, correct guarantee this system provides (see
+failure-handling.md). The seeded jobs' DEAD_LETTERED starting state
+was created directly via SQL, not via the real retry pipeline --
+DLQ-arrival correctness itself is separately and already proven in
+Scenario C, and is not re-tested here.
+
+## Limitations and anomalies actually observed (Scenario E)
+
+- The k6 __ITER-vs-iterationInTest incident above is the primary
+  anomaly of this scenario -- a real, found-and-fixed test-harness bug,
+  documented in full rather than silently corrected without record.
+- No other anomaly was observed in the corrected run. No job was
+  over-claimed. No claimed job failed to reach a terminal state. No
+  outbox event was left unpublished. No attempt-counter inconsistency.
+
+## Phase 11 status
+
+Scenarios A, B, C, D, and E have all been implemented and executed
+with real, captured evidence. No further load-testing scenarios are
+currently planned under the original Phase 11 design.
+
+
+
 ## Pending
 
 Scenarios D (outbox backlog during RabbitMQ outage) and E (replay

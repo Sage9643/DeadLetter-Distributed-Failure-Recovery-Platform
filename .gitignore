@@ -4,3 +4,4 @@ dist/
 *.log
 *.tsbuildinfo
 tests/load/k6/results/
+tests/load/k6/data/

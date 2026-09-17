@@ -257,6 +257,116 @@ async function verifyOutageRecovery() {
   );
   return true;
 }
+// Correctness checks for the replay-concurrency scenario. Verifies
+// ONLY jobs of type 'load_test_replay' (Scenario E's own seeded jobs)
+// -- deliberately does NOT touch or verify Scenario D's leftover
+// load_test_outage jobs or any other type, even if they happen to
+// still exist in the table.
+//
+// Core invariant (per the approved design): replay_count must NEVER
+// exceed 1 for any seeded job -- this is the scaled-up, k6-driven
+// equivalent of Phase 6's single-job proof that claimReplay's atomic
+// UPDATE (WHERE status='DEAD_LETTERED') allows at most one winner per
+// concurrent race. Does NOT claim exactly-once delivery or
+// exactly-once processing -- only exactly-one-successful-replay-claim
+// per job, which is the actual, correct, narrower guarantee this
+// system provides (see failure-handling.md).
+async function verifyReplayConcurrency() {
+  const totalResult = await pool.query(
+    `SELECT COUNT(*) as total FROM jobs WHERE type = 'load_test_replay'`
+  );
+  const total = Number(totalResult.rows[0].total);
+
+  console.log(`Total load_test_replay jobs found: ${total}`);
+
+  if (total === 0) {
+    console.log(
+      "FAIL: no load_test_replay jobs found. Either seedReplayJobs.js did not run, or this is the wrong database."
+    );
+    return false;
+  }
+
+  // Invariant 1: replay_count must never exceed 1, for any job.
+  const overReplayedResult = await pool.query(
+    `SELECT id, replay_count FROM jobs WHERE type = 'load_test_replay' AND replay_count > 1`
+  );
+  console.log(`Jobs with replay_count > 1: ${overReplayedResult.rows.length}`);
+  if (overReplayedResult.rows.length > 0) {
+    console.log("FAIL: the following jobs show replay_count > 1 -- this violates the core invariant:");
+    console.table(overReplayedResult.rows);
+    return false;
+  }
+
+  // Invariant 2: every job that was actually claimed (replay_count=1)
+  // must have progressed through the REAL, existing worker/outbox
+  // system to a legitimate terminal state -- COMPLETED (if it
+  // succeeded) or DEAD_LETTERED again (if the stub processor's default
+  // path happened to still fail it -- not expected here since seeded
+  // jobs carry an empty payload with no shouldFail flag, but checked
+  // rather than assumed).
+  const statusBreakdown = await pool.query(
+    `SELECT status, replay_count, COUNT(*) as count
+     FROM jobs WHERE type = 'load_test_replay'
+     GROUP BY status, replay_count
+     ORDER BY status, replay_count`
+  );
+  console.log("Status/replay_count breakdown for load_test_replay:");
+  console.table(statusBreakdown.rows);
+
+  const claimedRows = await pool.query(
+    `SELECT id, status, replay_count, attempt_count FROM jobs WHERE type = 'load_test_replay' AND replay_count = 1`
+  );
+  const claimedCount = claimedRows.rows.length;
+  const notTerminalCount = claimedRows.rows.filter(
+    (r) => r.status !== "COMPLETED" && r.status !== "DEAD_LETTERED"
+  ).length;
+
+  console.log(`Jobs with replay_count = 1 (won a claim): ${claimedCount}`);
+  console.log(`Of those, jobs NOT in a legitimate terminal state: ${notTerminalCount}`);
+
+  if (notTerminalCount > 0) {
+    console.log(
+      `FAIL: ${notTerminalCount} claimed job(s) have not reached a terminal state (COMPLETED or DEAD_LETTERED). A worker may still be processing -- wait and re-run.`
+    );
+    return false;
+  }
+
+  // Invariant 3: every claimed job's outbox event was actually
+  // published -- no unexpected pending outbox events remain for these
+  // jobs.
+  const pendingOutboxResult = await pool.query(
+    `SELECT COUNT(*) as count
+     FROM outbox_events oe
+     JOIN jobs j ON j.id = oe.job_id
+     WHERE j.type = 'load_test_replay' AND oe.published_at IS NULL`
+  );
+  const pendingOutboxCount = Number(pendingOutboxResult.rows[0].count);
+  console.log(`Still-pending outbox_events rows for load_test_replay jobs: ${pendingOutboxCount}`);
+
+  if (pendingOutboxCount !== 0) {
+    console.log(
+      `FAIL: ${pendingOutboxCount} outbox_events row(s) for these jobs are still unpublished. Wait longer and re-run if RabbitMQ is healthy, or investigate if not.`
+    );
+    return false;
+  }
+
+  // Invariant 4: attempt_count consistency for claimed jobs -- a
+  // replayed job resets attempt_count to 0 then increments on claim,
+  // so a job that completed via replay should show attempt_count >= 1
+  // (it was claimed and processed at least once post-replay).
+  const inconsistentAttemptResult = claimedRows.rows.filter((r) => r.attempt_count < 1);
+  console.log(`Claimed jobs with attempt_count < 1 (unexpected): ${inconsistentAttemptResult.length}`);
+  if (inconsistentAttemptResult.length > 0) {
+    console.log("FAIL: the following claimed jobs show attempt_count < 1, which is inconsistent with having been processed post-replay:");
+    console.table(inconsistentAttemptResult);
+    return false;
+  }
+
+  console.log(
+    `PASS: all ${total} load_test_replay jobs verified. ${claimedCount} job(s) were successfully claimed by replay (replay_count=1, never >1), all reached a legitimate terminal state, all corresponding outbox events published, attempt counters internally consistent.`
+  );
+  return true;
+}
 
 async function resetLoadDatabase() {
   console.log("Resetting deadletter_load: TRUNCATE TABLE jobs CASCADE (also clears outbox_events via FK)...");
@@ -286,8 +396,10 @@ async function main() {
     passed = await verifyFailingSubmission();
   } else if (mode === "outage") {
     passed = await verifyOutageRecovery();
+  } else if (mode === "replay") {
+    passed = await verifyReplayConcurrency();
   } else {
-    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, outage, reset.`);
+    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, outage, replay, reset.`);
     await pool.end();
     process.exit(1);
     return;
