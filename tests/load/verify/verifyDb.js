@@ -113,6 +113,7 @@ async function verifyConcurrentSubmission() {
 // policy (calculateBackoffMs, max_attempts=5) and reach DEAD_LETTERED --
 // never COMPLETED. This test exercises that existing behavior at real
 // HTTP-submitted volume; it does not alter it.
+
 async function verifyFailingSubmission() {
   const statusResult = await pool.query(
     `SELECT status, COUNT(*) as count FROM jobs WHERE type = 'load_test_failing' GROUP BY status`
@@ -144,10 +145,10 @@ async function verifyFailingSubmission() {
     );
     return false;
   }
-
   // All jobs are DEAD_LETTERED -- now check the SPECIFIC correctness
   // properties this scenario exists to verify: full exhaustion (not a
   // partial retry cycle) and populated dead-letter metadata.
+
   const wrongAttemptCountResult = await pool.query(
     `SELECT COUNT(*) as count FROM jobs WHERE type = 'load_test_failing' AND attempt_count != max_attempts`
   );
@@ -190,6 +191,73 @@ async function verifyFailingSubmission() {
   return true;
 }
 
+// Correctness checks for the outbox-outage scenario. Every job
+// submitted here is a NORMAL (non-failure-injected) job -- the point
+// is not retry/DLQ behavior (covered by Scenario C), but whether the
+// EXISTING transactional outbox (Phase 10, unmodified) correctly
+// recovers a backlog once RabbitMQ becomes reachable again, with no
+// manual intervention and no lost jobs.
+//
+// "Reached COMPLETED" here proves the FULL chain recovered: job
+// creation survived the outage (already proven in Phase 10's
+// Deliberate Test 4), the outbox dispatcher eventually published once
+// RabbitMQ returned, AND a worker consumed and completed the message.
+// This is stronger evidence than checking pendingOutboxEvents alone,
+// which only proves publication, not end-to-end delivery.
+async function verifyOutageRecovery() {
+  const statusResult = await pool.query(
+    `SELECT status, COUNT(*) as count FROM jobs WHERE type = 'load_test_outage' GROUP BY status`
+  );
+  console.log("Job status breakdown for load_test_outage:");
+  console.table(statusResult.rows);
+
+  const totalResult = await pool.query(
+    `SELECT COUNT(*) as total FROM jobs WHERE type = 'load_test_outage'`
+  );
+  const total = Number(totalResult.rows[0].total);
+
+  const completedRow = statusResult.rows.find((r) => r.status === "COMPLETED");
+  const completedCount = completedRow ? Number(completedRow.count) : 0;
+
+  const pendingOutboxResult = await pool.query(
+    `SELECT COUNT(*) as count
+     FROM outbox_events oe
+     JOIN jobs j ON j.id = oe.job_id
+     WHERE j.type = 'load_test_outage' AND oe.published_at IS NULL`
+  );
+  const pendingOutboxCount = Number(pendingOutboxResult.rows[0].count);
+
+  console.log(`Total load_test_outage jobs found: ${total}`);
+  console.log(`COMPLETED: ${completedCount}`);
+  console.log(`Still-pending outbox_events rows for these jobs: ${pendingOutboxCount}`);
+
+  if (total === 0) {
+    console.log(
+      "FAIL: no load_test_outage jobs found. Either the k6 scenario did not run against this database, or nothing has been submitted yet."
+    );
+    return false;
+  }
+
+  if (pendingOutboxCount !== 0) {
+    console.log(
+      `FAIL: ${pendingOutboxCount} outbox_events row(s) for these jobs are still unpublished. If RabbitMQ has been confirmed healthy and enough time has passed for the 2s dispatcher poll to run, this is unexpected -- otherwise, wait longer and re-run.`
+    );
+    return false;
+  }
+
+  if (completedCount !== total) {
+    console.log(
+      `FAIL: ${completedCount}/${total} reached COMPLETED, even though all outbox events for this job type are published. A worker may still be processing -- wait and re-run. If no worker is running against deadletter_load, start one first.`
+    );
+    return false;
+  }
+
+  console.log(
+    `PASS: all ${total} load_test_outage jobs were durably published (despite the deliberate RabbitMQ outage) and reached COMPLETED, with zero pending outbox events remaining.`
+  );
+  return true;
+}
+
 async function resetLoadDatabase() {
   console.log("Resetting deadletter_load: TRUNCATE TABLE jobs CASCADE (also clears outbox_events via FK)...");
   await pool.query("TRUNCATE TABLE jobs CASCADE;");
@@ -216,8 +284,10 @@ async function main() {
     passed = await verifyConcurrentSubmission();
   } else if (mode === "failing") {
     passed = await verifyFailingSubmission();
+  } else if (mode === "outage") {
+    passed = await verifyOutageRecovery();
   } else {
-    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, reset.`);
+    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, outage, reset.`);
     await pool.end();
     process.exit(1);
     return;

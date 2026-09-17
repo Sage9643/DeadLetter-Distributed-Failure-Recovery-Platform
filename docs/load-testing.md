@@ -211,6 +211,136 @@ exactly-once processing or publication.
   status, no job reaching DEAD_LETTERED via the wrong path (non-
   retryable vs. exhaustion), no missing dead-letter metadata.
 
+
+
+## Scenario D -- Outbox Backlog During RabbitMQ Outage
+
+Purpose: deliberately stop RabbitMQ, submit jobs via real k6-generated
+load while it is down, and verify -- via PostgreSQL directly -- that
+the existing, unmodified transactional outbox (Phase 10) durably
+records and later publishes every job once RabbitMQ recovers, with the
+full chain (job creation -> durable outbox record -> eventual publish
+-> worker consumption -> COMPLETED) completing correctly and with zero
+job loss. This is the same class of guarantee already proven with one
+manually-created job in Phase 10's Deliberate Test 4; this scenario
+exercises it at k6-generated volume rather than re-deriving it.
+
+Configuration (actual, as executed):
+- k6 executor: shared-iterations, 2 VUs, 10 total iterations,
+  maxDuration 30s
+- load_test_outage job type, empty payload (no shouldFail -- this
+  scenario tests outbox durability, not the worker's retry policy,
+  which is Scenario C's concern)
+- RabbitMQ deliberately stopped (docker compose stop rabbitmq) BEFORE
+  the k6 run, confirmed via docker compose ps (only deadletter-postgres
+  shown healthy)
+
+k6-reported results (real, from the executed run, with RabbitMQ
+genuinely down throughout):
+- 10 iterations / HTTP requests
+- 100.00% checks succeeded (10 / 10 submit status is 201) -- every
+  submission succeeded DESPITE RabbitMQ being unreachable, directly
+  confirming job creation does not depend on RabbitMQ reachability
+- 0.00% http_req_failed (0 out of 10)
+- http_req_duration: avg 60.85ms, min 10.43ms, med 12.75ms, max
+  256.56ms, p90 254.95ms, p95 255.75ms
+
+Real observed anomaly (not predicted in advance, recorded honestly):
+request latency was visibly higher and more variable during this
+outage run (p95 255.75ms) than in Scenario C's baseline under healthy
+RabbitMQ (p95 12.34ms), even though createJob's transaction never
+directly calls RabbitMQ. Root cause was not definitively identified in
+this run -- possible explanations include Postgres connection-pool
+contention from concurrent outbox-insert transactions, or some other
+factor -- and is recorded here as an open, unexplained observation
+rather than a confirmed diagnosis.
+
+GET /api/stats observation during the outage (live HTTP check, not the
+authoritative pass/fail source -- see below): totalJobs:10,
+byStatus.QUEUED:10, pendingOutboxEvents:10 -- confirming the full
+backlog was durably recorded in PostgreSQL with nothing silently lost.
+
+Recovery sequence (real, as executed):
+1. RabbitMQ restarted (docker compose start rabbitmq), confirmed
+   healthy via docker compose ps before proceeding
+2. First GET /api/stats check immediately after RabbitMQ reported
+   healthy: pendingOutboxEvents was ALREADY 0 -- the outbox dispatcher
+   published the entire backlog essentially immediately upon RabbitMQ
+   becoming reachable again, with no observed delay worth recording as
+   a duration figure
+3. However, COMPLETED remained 0 (byStatus.QUEUED:10) across two
+   consecutive checks after that -- investigated directly rather than
+   assumed to be normal drain time
+
+Real process gap discovered during this run (documented honestly, not
+smoothed over): investigation found NO WORKER PROCESS WAS RUNNING
+against deadletter_load at all during the outage/recovery observation
+window (the worker terminal had been closed earlier in this session
+when the development environment was restarted, and was not
+re-verified as part of this scenario's setup checklist before
+proceeding). This was NOT a RabbitMQ-reconnection failure of any kind
+-- once a worker was started, all 10 jobs completed within the very
+next check. This is recorded as a genuine gap in this scenario's
+execution process (a missing pre-flight check that a worker is
+actually running), not a system defect. A future run of this scenario
+should explicitly verify worker process liveness as part of its setup
+steps, the same way API/RabbitMQ health is already checked.
+
+PostgreSQL-verified results (the authoritative pass/fail source, via
+node tests/load/verify/verifyDb.js outage, run after the above gap was
+resolved by starting a worker):
+- Exactly 10 job rows found with type = load_test_outage -- matching
+  k6's iteration count exactly
+- All 10 reached status = COMPLETED
+- 0 outbox_events rows for these jobs remain unpublished
+  (published_at IS NULL)
+- Script exited 0, printed PASS
+
+## Explicit scope of the Scenario D result
+
+This result validates the system's behavior under this particular
+small, fixed-volume local outage-and-recovery workload (10 jobs, one
+worker, one deliberate RabbitMQ outage) and corroborates, at
+k6-generated volume, the same outbox-durability guarantee Phase 10's
+Deliberate Test 4 first proved with a single manually-created job. It
+is NOT a general scalability claim -- no conclusion is drawn about
+backlog size limits, outage duration limits, or behavior under a much
+larger concurrent backlog. It does NOT prove or claim exactly-once
+publication or processing -- the outbox's documented duplicate-
+publication window (a crash between a successful RabbitMQ publish and
+markOutboxPublished committing) is untouched by this scenario and
+remains proven separately, deterministically, in
+apps/api/src/__tests__/integration/dispatcher.test.ts. This scenario
+also does NOT touch, exercise, or make any claim about Incident 5
+(Phase 6, the API's cached RabbitMQ channel not auto-recovering after
+a broker restart) -- the API's outbox dispatcher's publish attempts
+were observed to succeed immediately upon RabbitMQ's recovery in this
+run, which is consistent with Incident 5 remaining unfixed but simply
+not being triggered by this particular scenario's timing; no claim is
+made here about whether Incident 5's failure mode was avoided by
+design or by circumstance.
+
+## Limitations and anomalies actually observed (Scenario D)
+
+- Real, unexplained request-latency increase during the outage
+  (p95 255.75ms vs. Scenario C's healthy-RabbitMQ baseline of
+  p95 12.34ms) -- root cause not identified in this run.
+- A real process gap: no worker was running during initial
+  observation, discovered via direct investigation (checking the
+  worker terminal and GET /api/stats showing zero progress across
+  repeated checks) rather than assumed. Once corrected, the outbox and
+  worker both behaved correctly.
+- The outbox dispatcher's recovery-to-first-successful-publish timing
+  was too fast to measure precisely in this run (pendingOutboxEvents
+  was already 0 on the very first post-recovery check) -- no more
+  precise "outage recovery latency" figure is available from this run.
+- No other anomaly was observed. No job was lost. No duplicate
+  publication was observed (though this scenario was not designed to
+  detect one, and does not claim to have tested for it -- see
+  dispatcher.test.ts for the deterministic duplicate-publication
+  proof).
+
+
 ## Pending
 
 Scenarios D (outbox backlog during RabbitMQ outage) and E (replay
