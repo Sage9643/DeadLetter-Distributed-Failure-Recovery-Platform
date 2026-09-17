@@ -291,3 +291,12 @@ failure-handling.md and engineering-decisions.md.
 Verified real via a deliberate RabbitMQ-outage test -- see
 development-log.md for the full walkthrough with real job IDs,
 timestamps, and attempt counts.
+
+
+## Note on CI/CD (as of Phase 11)
+
+`.github/workflows/` was scaffolded empty in Phase 0 and has never been
+populated. No automated CI currently runs the Jest suite or any future
+k6 load tests on push/PR. This is acknowledged explicitly here, not
+addressed as part of Phase 11 -- CI wiring remains a distinct, future
+decision.

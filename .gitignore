@@ -3,3 +3,4 @@ dist/
 .env
 *.log
 *.tsbuildinfo
+tests/load/k6/results/
