@@ -397,3 +397,71 @@ platform binary). The workflow file itself has not yet been exercised
 by an actual GitHub Actions run, since doing so requires a push, which
 this phase deliberately does not perform -- see development-log.md for
 the full, honest accounting of what was and was not verified.
+## RabbitMQ connection recovery (Phase 14)
+
+Resolves Incident 5 (Phase 6) and Incident 8 (Phase 12) -- see
+incidents-and-failures.md for the full incident record and the
+Phase 14 update appended to Incident 8.
+
+**Problem:** `apps/api/src/queue/connection.ts` and
+`apps/worker/src/queue/connection.ts` each cached a single
+connection/channel pair in a module-level variable and only ever
+checked whether that variable was non-null, never whether the
+underlying broker connection was actually still alive. If RabbitMQ
+restarted or the connection dropped while a channel was already
+cached, the stale object stayed cached indefinitely -- every
+subsequent publish (API) or the entire consumer subscription (worker)
+stayed broken until a manual process restart, with the two real chaos
+executions in Incident 8 showing this could resolve itself or not,
+unpredictably, depending on incidental amqplib event timing.
+
+**Fix:** both connection modules now attach `'error'`/`'close'`
+listeners to the connection and the channel at the moment each is
+created. Either event nulls the cached references and emits an
+`"invalidated"` event on a small exported `connectionEvents`
+(`EventEmitter`). An identity check (comparing against the exact
+connection/channel instance the listener was attached to) guards
+against a stale, late-arriving event from an already-replaced
+connection clobbering a newer, healthy one. A `closingIntentionally`
+flag, set for the duration of an explicit `closeConnection()` call,
+prevents that same intentional close from being mistaken for a
+failure and triggering a reconnect.
+
+- **API side:** no further change needed. `publishJobCreated()` is
+  only ever called by the outbox dispatcher's existing 2-second poll
+  loop (job creation and replay both go through the outbox since Phase
+  10, not a direct synchronous publish) -- once the cache is null, the
+  next scheduled `getChannel()` call reconnects naturally. The poll
+  loop itself already acts as the retry mechanism; no separate backoff
+  scheduler was added.
+- **Worker side:** reconnecting `getChannel()` alone is not enough,
+  because the consumer's `channel.consume()` subscription dies with
+  the channel and nothing re-attaches it to a new one automatically.
+  `apps/worker/src/consumer.ts` extracts the "attach prefetch + consume
+  to whatever channel getChannel() returns" step into its own
+  function, called once at startup and again, automatically, every
+  time `connectionEvents` emits `"invalidated"`, via a capped
+  exponential backoff loop (1s, doubling, capped at 30s) guarded
+  against overlapping triggers.
+
+**Deliberately unchanged:** the message-handling closure inside the
+worker's consumer (claim/process/ack/nack, retry/DLQ routing) is
+byte-for-byte the same code, only moved into its own function so both
+the initial subscribe and every later resubscribe share it. No change
+was made to the dispatcher's polling interval/batch size, the outbox
+schema or claiming logic, or either app's public `getChannel()` /
+`closeConnection()` signatures.
+
+**Validation status:** see development-log.md's Phase 14 addendum and
+the updated Phase 14 update on Incident 8 in incidents-and-failures.md
+for the full, honest accounting. In short: a real TypeScript build
+passed for both apps, and both real Jest suites passed on the user's
+real Windows environment -- `apps/api`: 18 suites / 82 tests, `apps/worker`:
+4 suites / 15 tests -- including all three new Phase 14 unit tests
+(after a test-only synchronization fix to `consumerResubscribe.test.ts`
+documented in the Phase 14 addendum; the recovery implementation
+itself was not changed for that fix). A real RabbitMQ chaos test
+against the actual Docker Compose stack demonstrated both the
+API/dispatcher and the worker/consumer recovering automatically, with
+neither process restarted. No recovery timing/duration was measured or
+is claimed.

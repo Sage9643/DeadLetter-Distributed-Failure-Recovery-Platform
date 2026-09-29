@@ -580,6 +580,21 @@ outcome occurs, and no code change has been made to
 protected component to force one outcome, per the Phase 12 scope
 guard. The worker's consumer, in both runs, did NOT self-recover and
 required a restart -- this part is consistent across both executions.
+
+**Update (Phase 14):** `apps/api/src/queue/connection.ts` and
+`apps/worker/src/queue/connection.ts` were changed specifically to
+address this -- event-listener-driven cache invalidation plus, on the
+worker side, automatic resubscription with backoff. See
+incidents-and-failures.md's Phase 14 update on Incident 8 and
+engineering-decisions.md for the design. **This fix has since been
+validated by re-running this exact chaos test** against the real
+Docker Compose stack: RabbitMQ was stopped (with a channel already
+cached, evidenced by a pre-outage job that reached `COMPLETED`) and
+restarted, neither the API nor the worker process was restarted, and a
+fresh post-recovery job reached `COMPLETED` with
+`pendingOutboxEvents = 0` afterward -- see development-log.md's Phase
+14 addendum for the full result. No recovery timing/duration was
+measured, so none is reported here.
 See incidents-and-failures.md, Incident 8, for the full record.
 
 ### k6 scenario: rate-limit-backpressure.js

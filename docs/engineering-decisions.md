@@ -974,3 +974,141 @@ arbitrary LTS number. If the project's real development machine is on
 a different Node major version, that should be reconciled explicitly
 (an `.nvmrc` would be a reasonable follow-up), not silently assumed
 here.
+
+## Decision: RabbitMQ reconnection via event-listener cache invalidation, not a periodic liveness poll
+
+**Context:** Phase 14 needed to fix Incident 5/8 (connection.ts caches
+a channel and never notices when it dies).
+
+**Chosen approach:** attach `'error'`/`'close'` listeners to the
+connection and channel at creation time, and null the cache reactively
+when either fires, rather than periodically calling something like
+`checkQueue()` on a timer to proactively probe liveness.
+
+**Why:** amqplib already emits these events the moment the underlying
+socket/protocol actually closes -- reacting to them is immediate and
+free. A polling probe would either run so infrequently that recovery
+is still slow, or so frequently that it adds meaningful, pointless
+RabbitMQ traffic under normal healthy operation, for information the
+library is already handing over via events. This is also literally
+the fix Phase 6 identified by name ("event-listener-driven cache
+invalidation") -- implementing anything else would be solving a
+different, unasked-for problem.
+
+## Decision: identity-checked invalidation, not a blind module-level null
+
+**Context:** the straightforward version of the fix is: `connection.on
+("close", () => { channel = null; connection = null; })`. That has a
+real race: amqplib's "close"/"error" delivery is asynchronous relative
+to application code, so a **stale** event from an already-replaced
+connection could fire after `getChannel()` has already reconnected,
+and blindly null the module state would clobber the new, healthy
+connection based on an event about the old, already-dead one.
+
+**Chosen approach:** each listener closes over the exact
+connection/channel instance it was attached to and only nulls the
+module-level cache if that instance is still the one currently cached
+(`if (connection !== newConnection && channel !== newChannel) return;`).
+
+**Why:** this is the minimum change needed to make the fix actually
+correct rather than introducing a new, subtler bug while fixing an old
+one -- silently breaking a healthy connection because of a
+late-arriving event about a connection that was already, correctly,
+replaced would be a regression, not a fix.
+
+## Decision: worker reconnect backoff is separate from job-level retry policy
+
+**Context:** `apps/worker/src/retry/retryPolicy.ts` already has
+`calculateBackoffMs()` for job processing retries (Phase 4).
+
+**Chosen approach:** `consumer.ts`'s `resubscribeWithBackoff()` uses
+its own small, local, capped-exponential constants (1s base, doubling,
+30s ceiling) rather than reusing `calculateBackoffMs()`.
+
+**Why:** `calculateBackoffMs()` is parameterized by a job's
+`attempt_count` and is tuned for how long a job-type-specific
+downstream dependency might need before a retry is worth attempting --
+a business/job-processing concern with its own tuning history (see the
+Phase 4 decision on the backoff formula/constants). Connection-level
+reconnection is a different concern (how fast should this process try
+to re-establish transport to its own message broker) with different
+natural time constants, and reusing the job-retry function would
+couple two unrelated pieces of tuning together for no real benefit --
+changing one's constants for job-processing reasons would silently
+change the other's reconnect cadence too.
+
+## Decision: an intentional-close guard (`closingIntentionally`), not skipping listener attachment during shutdown
+
+**Context:** `closeConnection()` (called by both apps' clean-shutdown
+paths) calls `channel.close()`/`connection.close()`, which themselves
+trigger the exact same `'close'` events the new invalidation logic
+listens for. Without a guard, a normal SIGTERM/SIGINT shutdown would
+emit `"invalidated"`, and on the worker side that would kick off
+`resubscribeWithBackoff()` -- attempting to reconnect to RabbitMQ
+moments before the process exits.
+
+**Chosen approach:** a module-level `closingIntentionally` flag, set
+`true` for the duration of `closeConnection()` and checked inside the
+invalidation handler before it emits `"invalidated"`.
+
+**Why:** the alternative -- removing the listeners before calling
+`.close()` -- is more fragile (has to precisely track and remove the
+exact listener functions that were attached, per connection instance)
+for the same result. A single boolean checked in one place is simpler
+and keeps `getChannel()`'s listener-attachment logic itself unchanged
+regardless of why a close might later happen.
+
+## Decision: unit-test the reconnection logic against a mocked amqplib, not skip testing it
+
+**Context:** the whole point of Phase 14 is behavior that can only be
+observed by actually breaking a live RabbitMQ connection -- something
+no earlier phase's tests attempt, because every existing test that
+touches RabbitMQ does so against a real, healthy broker (see
+`dispatcher.test.ts`'s own "real RabbitMQ" framing). This session's
+environment has no way to start or stop a real broker (see
+development-log.md, Phase 14).
+
+**Chosen approach:** three new unit tests
+(`apps/api/src/__tests__/unit/connectionRecovery.test.ts`,
+`apps/worker/src/__tests__/unit/connectionRecovery.test.ts`,
+`apps/worker/src/__tests__/unit/consumerResubscribe.test.ts`) that
+`jest.mock("amqplib")` with a small fake `EventEmitter`-based
+connection/channel, so a broker "dying" can be simulated deterministically
+by emitting a `'close'`/`'error'` event on the fake objects.
+
+**Why:** this is the first place in the project that mocks amqplib
+rather than using a real broker -- a deliberate, narrow exception to
+the project's general "test against real infrastructure" preference
+(see testing.md), made only because the specific behavior under test
+(does the cache-invalidation/resubscribe LOGIC run correctly when a
+disconnect event fires) is not otherwise triggerable at all inside a
+Jest run, real broker or not. This does not replace real chaos-test
+evidence -- it proves the logic is internally correct; only a real
+RabbitMQ outage against the real Docker Compose stack proves the whole
+system recovers. That outage has since been performed for real, with
+neither the API nor the worker process restarted (see
+incidents-and-failures.md, Incident 8's Phase 14 update, and
+development-log.md's Phase 14 addendum for the full result).
+
+## Decision: preserve the worker's existing initial-boot-failure behavior unchanged
+
+**Context:** if RabbitMQ is unreachable when the worker first starts,
+`startConsumer()` (via `getChannel()`) throws, and `index.ts`'s
+`.catch(err => { logger.error(...); process.exit(1); })` exits the
+process -- existing, Phase 0-era behavior, unrelated to Incident 5/8
+(which is specifically about a connection that was previously working
+and then died, not initial connectivity).
+
+**Chosen approach:** Phase 14 does not touch this path.
+`resubscribeWithBackoff()`'s retry loop is wired only to the
+`"invalidated"` event, which fires after a successful connection is
+later torn down -- never on the very first connect attempt made by
+`startConsumer()` itself.
+
+**Why:** retrying indefinitely on initial boot is a different,
+reasonable-but-separate design question (should the worker wait for
+RabbitMQ to become available, or fail fast so an orchestrator/operator
+notices immediately) that the project has not asked to have answered
+here, and changing it would be exactly the kind of "redesign a working
+system because you see a possible improvement" this project's
+guardrails explicitly warn against.

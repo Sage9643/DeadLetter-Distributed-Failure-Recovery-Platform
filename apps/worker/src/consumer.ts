@@ -1,4 +1,4 @@
-import { getChannel, QUEUE_NAME } from "./queue/connection";
+import { getChannel, QUEUE_NAME, connectionEvents } from "./queue/connection";
 import {
   getJobById,
   claimJob,
@@ -30,7 +30,15 @@ function isInvalidTextRepresentationError(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code?: string }).code === "22P02";
 }
 
-export async function startConsumer(): Promise<void> {
+// Phase 14: attaches prefetch + the message handler to whatever
+// channel getChannel() currently returns. Called once at startup and
+// again, automatically, every time the cached channel is invalidated
+// (broker restart, network drop -- see queue/connection.ts and
+// docs/incidents-and-failures.md, Incident 5/8). Extracted out of
+// startConsumer() so the first connect and every later reconnect share
+// the exact same handler -- no duplicated or drifted logic between the
+// two call sites.
+async function subscribe(): Promise<void> {
   const channel = await getChannel();
   await channel.prefetch(1);
 
@@ -169,4 +177,52 @@ export async function startConsumer(): Promise<void> {
     },
     { noAck: false }
   );
+}
+
+const RECONNECT_BASE_DELAY_MS = 1000;
+const RECONNECT_MAX_DELAY_MS = 30000;
+
+let reconnecting = false;
+
+// Phase 14: resolves Incident 5/8's worker-side finding ("the worker's
+// consumer did NOT self-recover in either [chaos test] execution and
+// required a restart both times"). Triggered by connection.ts's
+// "invalidated" event -- never by an intentional shutdown, since
+// closeConnection() suppresses that event (see connection.ts). Capped
+// exponential backoff, reusing the same doubling-with-ceiling shape as
+// the job-level retry policy but implemented separately and locally:
+// this is a connection-liveness concern, not a job-processing concern,
+// and conflating the two would tie unrelated semantics together for no
+// real benefit. Guarded by `reconnecting` so overlapping "invalidated"
+// events (a channel closing as a direct consequence of its connection
+// closing fires both) trigger exactly one retry loop, not two racing
+// ones.
+async function resubscribeWithBackoff(): Promise<void> {
+  if (reconnecting) return;
+  reconnecting = true;
+  let delayMs = RECONNECT_BASE_DELAY_MS;
+
+  try {
+    while (true) {
+      try {
+        await subscribe();
+        logger.info("Worker RabbitMQ consumer resubscribed after disconnect");
+        return;
+      } catch (err) {
+        logger.error({ err, nextRetryMs: delayMs }, "Worker failed to resubscribe to RabbitMQ; retrying");
+        await sleep(delayMs);
+        delayMs = Math.min(delayMs * 2, RECONNECT_MAX_DELAY_MS);
+      }
+    }
+  } finally {
+    reconnecting = false;
+  }
+}
+
+connectionEvents.on("invalidated", () => {
+  void resubscribeWithBackoff();
+});
+
+export async function startConsumer(): Promise<void> {
+  await subscribe();
 }

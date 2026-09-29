@@ -330,6 +330,39 @@ pendingOutboxEvents and health/ready together, not either in isolation,
 remains the recommended diagnostic approach regardless -- see Incident
 8 for the full, still-open question of why the two runs disagree.
 
+## RabbitMQ connection recovery signals (Phase 14)
+
+Both `apps/api/src/queue/connection.ts` and
+`apps/worker/src/queue/connection.ts` now log a structured
+`logger.warn({ err }, "RabbitMQ <reason>; invalidating cached
+connection/channel")` line the instant a connection or channel
+actually dies (reasons: "connection error", "connection closed",
+"channel error", "channel closed") -- previously, a dead connection
+produced no log signal at all beyond whatever downstream `.publish()`
+failure happened to surface (see Incident 5). On the worker side,
+`consumer.ts` additionally logs `"Worker failed to resubscribe to
+RabbitMQ; retrying"` (with the next backoff delay) on each failed
+reconnect attempt, and `"Worker RabbitMQ consumer resubscribed after
+disconnect"` on success -- an operator watching worker logs can now
+see a disconnect/recovery cycle happen in real time instead of only
+seeing message processing silently stop. None of this is wired into
+`GET /api/stats` or any other structured metric yet -- it is log-level
+visibility only, consistent with how this project has treated
+per-attempt processing duration (see the relevant Phase 8 decision in
+engineering-decisions.md: log-level, not a persisted aggregate,
+until there is a real need for more).
+
+**Real-world exercise of these signals:** a real RabbitMQ chaos test
+(stop/restart against the actual Docker Compose stack, with neither
+the API nor the worker process restarted) has since exercised this
+recovery path end-to-end -- see development-log.md's Phase 14 addendum
+and incidents-and-failures.md's Incident 8 for the result
+(`pendingOutboxEvents = 0` and a post-recovery job reaching
+`COMPLETED`). The specific log lines above were not captured or pasted
+as part of that validation round, so this document does not claim they
+were directly observed in that run -- only that the code path which
+emits them is the one the chaos test exercised.
+
 ## Known gap, honestly documented
 
 dispatchOutboxBatch's returned `failed` count is currently always 0

@@ -280,3 +280,41 @@ This is documented as a real, encountered engineering problem -- not
 smoothed over -- because it directly demonstrates why "the changelog
 says X" is not equivalent to "verified working," a principle this
 project has applied consistently since Phase 2's amqplib version check.
+## Phase 14 -- first amqplib-mocked unit tests
+
+Every prior test touching RabbitMQ (`dispatcher.test.ts`, the Phase 5
+consumer/worker concurrency tests, etc.) runs against a real, healthy
+broker -- consistent with this project's general preference for real
+infrastructure over mocks. Phase 14's connection-recovery fix needed a
+narrow, deliberate exception: the behavior under test is specifically
+what happens when a connection/channel dies, which cannot be triggered
+deterministically (or, from most environments, at all) against a real
+broker inside a Jest run.
+
+`apps/api/src/__tests__/unit/connectionRecovery.test.ts`,
+`apps/worker/src/__tests__/unit/connectionRecovery.test.ts`, and
+`apps/worker/src/__tests__/unit/consumerResubscribe.test.ts` each
+`jest.mock("amqplib")` with a small `EventEmitter`-based fake
+connection/channel, so a `'close'`/`'error'` event can be emitted
+directly and the resulting reconnect/resubscribe behavior asserted
+deterministically. See engineering-decisions.md's "unit-test the
+reconnection logic against a mocked amqplib" decision for the full
+reasoning, and incidents-and-failures.md's Phase 14 update on
+Incident 8 for why a real chaos re-test was still separately needed --
+these unit tests prove the logic is internally correct, not that the
+whole system recovers against a genuine outage.
+
+**Real execution result:** run for real on the user's Windows
+environment, `apps/worker`'s suite (including both
+`connectionRecovery.test.ts` and `consumerResubscribe.test.ts`) passed
+4/4 suites, 15/15 tests -- after a test-only synchronization fix to
+`consumerResubscribe.test.ts` (see development-log.md's Phase 14
+addendum for the reproduction, root cause, fix and verification of
+that test bug; the recovery implementation itself was not changed).
+`apps/api`'s Jest suite (including `connectionRecovery.test.ts`) has
+since also been run for real on the user's Windows environment: 18
+suites passed, 82 tests passed. Separately, a real RabbitMQ chaos test
+against the actual Docker Compose stack has now also been performed -- see
+incidents-and-failures.md, Incident 8, and development-log.md's Phase
+14 addendum -- providing the whole-system evidence these unit tests
+were never meant to substitute for.

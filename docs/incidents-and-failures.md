@@ -363,6 +363,9 @@ likely a retry/backoff strategy for reconnection attempts) is
 identified as a concrete future improvement, out of scope for this
 phase.
 
+**Update (Phase 14):** implemented -- see the Phase 14 update at the
+end of Incident 8 below for the fix and its current validation status.
+
 **Engineering lesson:** A cached resource (connection, channel, client)
 needs an explicit invalidation path tied to the actual liveness of the
 underlying resource, not just a "does this variable exist" check.
@@ -688,3 +691,63 @@ already cached) at the moment of failure. The more realistic case
 deliberately reproducing the outage a second time, in a different
 process state, rather than trusting the first successful result as
 general proof.
+
+**Update (Phase 14) -- event-listener-driven cache invalidation
+implemented:** `apps/api/src/queue/connection.ts` and
+`apps/worker/src/queue/connection.ts` now attach `'error'`/`'close'`
+listeners to both the connection and the channel at the moment each is
+created, nulling the cached references (and emitting a
+`connectionEvents` `"invalidated"` event) the instant either one
+actually dies -- exactly the fix identified as missing back in Phase 6
+("event-listener-driven cache invalidation"). This closes the
+structural gap this incident is about: `getChannel()` no longer depends
+on the cached `channel` variable happening to already be `null`
+(Deliberate Test 4's scenario) for recovery to occur -- it now always
+re-evaluates liveness via an explicit signal, regardless of whether a
+channel was cached at the moment of failure. On the worker side, since
+reconnecting `getChannel()` alone was never enough (the consumer's
+`channel.consume()` subscription dies with the channel and nothing
+previously re-attached it), `apps/worker/src/consumer.ts` now listens
+for that same `"invalidated"` event and resubscribes with a capped
+exponential backoff (1s, doubling, capped at 30s) -- closing the "the
+worker's consumer did NOT self-recover in either execution" finding
+from this incident. An explicit `closingIntentionally` guard in both
+connection.ts files prevents this new logic from misfiring during a
+normal, intentional shutdown (SIGTERM/SIGINT), which also closes the
+channel/connection and would otherwise look identical to a failure.
+
+**What this does and does not resolve:** the fix makes recovery
+structurally deterministic (an explicit signal, not incidental amqplib
+internal timing) instead of the conditional, unexplained behavior this
+incident documented across two real executions. It does NOT explain
+why Incident 8's two prior executions disagreed -- that remains an
+open, unadopted question, left exactly as recorded above, since the
+fix makes the answer moot going forward rather than resolving it
+retroactively.
+
+**Validation status (updated -- real evidence obtained):** this fix
+has now been verified by (a) a real TypeScript build of both
+`apps/api` and `apps/worker`, (b) the three mocked-amqplib unit tests
+listed above run for real on the user's Windows environment --
+`apps/worker`: 4 suites / 15 tests passed, including both
+`connectionRecovery.test.ts` and `consumerResubscribe.test.ts` (after
+a test-only synchronization fix to `consumerResubscribe.test.ts`; see
+development-log.md's Phase 14 addendum for the reproduction, root
+cause, fix and verification of that test bug -- the recovery
+implementation itself was not changed), and (c) a real RabbitMQ chaos
+test against the actual Docker Compose stack: RabbitMQ was stopped and
+restarted, the API and worker processes were **not** restarted, a job
+submitted before the outage and a job submitted after recovery both
+reached `COMPLETED`, and `GET /api/stats` showed
+`pendingOutboxEvents = 0` after recovery. See development-log.md's
+Phase 14 addendum for the full result and for why this evidence
+specifically rules out the "Deliberate Test 4" false-positive pattern
+(no channel ever cached) previously seen in this incident -- a channel
+was demonstrably live and in use, having just completed the
+pre-outage job, before RabbitMQ was stopped this time. Both real Jest
+suites have since passed on the user's Windows environment --
+`apps/api`: 18 suites / 82 tests, `apps/worker`: 4 suites / 15 tests --
+closing the "apps/api's real Jest results" gap noted earlier in this
+validation round. **Still not claimed:** specific recovery
+timing/duration or raw structured log-line evidence, since neither was
+captured or reported.

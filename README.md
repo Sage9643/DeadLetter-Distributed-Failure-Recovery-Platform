@@ -4,6 +4,8 @@
 
 Distributed Failure Capture, Recovery & Event Replay Platform.
 
-Status: Phase 13 — CI/CD pipeline (GitHub Actions). See
-`docs/development-log.md` for the full phase-by-phase history and
+Status: Phase 14 — RabbitMQ connection recovery (resolves Incident
+5/8), validated against a real RabbitMQ outage on the real Docker
+Compose stack (neither the API nor the worker process was restarted).
+See `docs/development-log.md` for the full phase-by-phase history and
 `docs/architecture.md` for the current system design.

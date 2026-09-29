@@ -1812,3 +1812,212 @@ above. Phase 10 (outbox), Phase 11 (load-test guarantees), and Phase 12
 (rate limiting/backpressure) behavior is therefore unaffected by
 construction, not merely by assertion -- there is no code diff for any
 of those components to regress.
+
+## Phase 14 -- RabbitMQ Connection Recovery (resolves Incident 5/8)
+
+**Goal:** close the reliability gap explicitly flagged as deferred
+across three prior phases -- Incident 5 (Phase 6): "identified as a
+concrete future improvement, out of scope for this phase"; Incident 8
+(Phase 12): "This remains an open item for a future phase." Both a
+broker connection dying and the API/worker not recovering from it on
+their own.
+
+**Why this phase, not something else:** determined by reading
+README.md, architecture.md, development-log.md, engineering-decisions.md,
+testing.md, load-testing.md, observability.md, incidents-and-failures.md,
+api.md, database.md, failure-handling.md, and recent git history.
+Several genuinely-deferred items exist in this repository (an
+`GET /api/jobs/:id/attempts` endpoint, a `job_attempts` table, a DLQ
+listing/inspection endpoint, load-testing Scenarios D/E, deployment
+tooling/`docs/deployment.md`), but Incident 8's closing line --
+"This remains an open item for a future phase" -- is the most
+explicit, most-repeated (Phase 6, then again at Phase 12) in-repository
+flag of intended future work, and it sits squarely inside this
+project's own stated priority: failure recovery, in a platform whose
+entire purpose is failure capture and recovery. `docs/api.md`'s
+"Not yet implemented" list was checked against the real
+`apps/api/src/routes/jobs.ts` and found stale -- `GET /api/jobs`,
+`POST /api/jobs/:id/replay`, and `GET /api/stats` are all actually
+implemented; that list was not treated as a reliable signal.
+
+**Implementation:**
+- `apps/api/src/queue/connection.ts` -- added `connectionEvents`
+  (EventEmitter), `'error'`/`'close'` listeners on the connection and
+  channel with identity-checked invalidation, and a
+  `closingIntentionally` guard. `checkRabbitMQHealth()` and
+  `closeConnection()` are otherwise unchanged.
+- `apps/worker/src/queue/connection.ts` -- identical pattern, all
+  existing topology setup (main exchange/queue, failures exchange,
+  retry queue TTL+DLX, DLQ) preserved exactly.
+- `apps/worker/src/consumer.ts` -- extracted the existing
+  prefetch+consume setup (and its entire message-handling closure,
+  moved verbatim, not rewritten) into a `subscribe()` function, added
+  `resubscribeWithBackoff()` (capped exponential, 1s-30s) wired to
+  `connectionEvents`'s `"invalidated"` event.
+
+See architecture.md's new "RabbitMQ connection recovery (Phase 14)"
+section for the full design and engineering-decisions.md for the
+reasoning behind each specific choice.
+
+**Real verification performed from this session's own environment
+(device-bridge shell -- the same one used for every prior phase):**
+
+- `cd apps/api && npx tsc` -- **PASS** (real build).
+- `cd apps/worker && npx tsc` -- **PASS** (real build).
+- A full project-wide type check (`tsc -p` against a temporary,
+  unstaged config extending each app's real tsconfig plus jest/node
+  types, covering every file under `src/`, deleted immediately after)
+  was run for both apps as a stronger check than the per-file
+  ts-jest-style check used elsewhere: **`apps/worker` -- zero errors,
+  clean.** `apps/api` surfaced 5 real type errors, but every one is in
+  `apps/api/src/__tests__/unit/rateLimiter.test.ts` -- a pre-existing
+  Phase 12 file this phase never touched (a `req.header` mock's return
+  type narrower than Express's own `set-cookie`-aware overload). Zero
+  of the 5 errors reference `connection.ts`, `consumer.ts`, or any file
+  this phase changed or added. Not fixed here -- out of scope, flagged
+  for a future pass rather than silently repaired mid-phase.
+- Three new unit tests written
+  (`apps/api/src/__tests__/unit/connectionRecovery.test.ts`,
+  `apps/worker/src/__tests__/unit/connectionRecovery.test.ts`,
+  `apps/worker/src/__tests__/unit/consumerResubscribe.test.ts`), each
+  individually type-checked clean via the same standalone-file `tsc
+  --ignoreConfig` technique used for every test file in this phase.
+  **These tests were NOT executed** -- this session's device-bridge
+  shell has the identical `ts-jest`/`node_modules`-hoisting limitation
+  documented in every prior phase's closure (`Preset ts-jest not found
+  relative to rootDir`), confirmed again this phase, not newly
+  discovered. Whether these three files actually pass under a real
+  Jest run is therefore genuinely unverified by this session and needs
+  either the user's real environment or the next GitHub Actions run to
+  confirm -- exactly the same honest gap Phase 12 and Phase 13 each
+  had for their own Jest suites at this point in the process.
+- `git status --short` after all builds/type-checks -- confirmed clean
+  of stray files (`dist/`, `*.tsbuildinfo`, and the two temporary
+  full-project tsconfig files used only for the check above, all
+  removed/gitignored).
+
+**Genuine, honestly-flagged limitation of this phase's verification:**
+this session's device-bridge shell has no `docker` binary, so there is
+no way to start, stop, or restart a real RabbitMQ broker from here --
+the actual chaos-test re-run that would directly confirm this fix
+(kill RabbitMQ with a channel already cached, confirm the API
+dispatcher and worker consumer both resume automatically, without a
+process restart, this time) has **not** been performed. This is the
+single most important piece of evidence this phase still needs, and it
+is not something this session can produce: it requires the user's real
+Docker Compose environment, exactly as Phase 12's original chaos/k6
+evidence did. Until that re-test happens, this phase's fix should be
+treated as "implemented and unit-tested against mocked failure
+scenarios," not "proven to resolve Incident 5/8 in production."
+
+**Regression check:** `git diff --stat` confines this phase's changes
+to exactly 3 modified files (`apps/api/src/queue/connection.ts`,
+`apps/worker/src/queue/connection.ts`, `apps/worker/src/consumer.ts`)
+plus 3 new test files -- no other application file was touched. The
+public API of both connection modules (`getChannel`, `closeConnection`,
+`checkRabbitMQHealth`, all exported topology constants) is unchanged in
+signature and happy-path behavior; the only new behavior is what
+happens after a `'close'`/`'error'` event, which no existing test
+(Phase 5-13) triggers. `apps/api/src/__tests__/integration/dispatcher.test.ts`
+(the one existing test that calls `closeConnection()`) was reasoned
+through explicitly: its `afterAll` cleanup call now correctly does
+*not* emit `"invalidated"` (the `closingIntentionally` guard), so its
+existing assertions are unaffected. This reasoning has not been
+confirmed by an actual test run, for the same reason noted above.
+
+### Phase 14 addendum -- real validation (Jest + RabbitMQ chaos test)
+
+This addendum records what happened when the two gaps flagged above
+(real Jest execution, real chaos re-test) were actually closed, on the
+user's real Windows/Docker environment -- this session still has
+neither `docker` nor a working Jest run (confirmed again during this
+addendum: `npx jest --listTests` in `apps/worker` still fails with
+`Preset ts-jest not found relative to rootDir`), so everything below
+is the user's reported real-environment output, trusted the same way
+Phase 12's and Phase 13's real Windows/CI results were.
+
+**Encountered failure -- worker Jest, first real run:**
+
+- **Reproduction:** `cd apps/worker && npm.cmd test -- --runInBand` --
+  3 of 4 suites passed (14/15 tests); `consumerResubscribe.test.ts`
+  failed one of its two tests with `Expected number of calls: 1,
+  Received number of calls: 0`. The worker's own runtime log for that
+  same run showed `"Worker failed to resubscribe to RabbitMQ;
+  retrying"` followed by `"Worker RabbitMQ consumer resubscribed after
+  disconnect"` -- i.e. the actual resubscribe logic worked; only the
+  test's own synchronization was wrong.
+- **Root cause:** `getChannel()`'s real reconnect path awaits roughly
+  ten sequential async calls (`connect` -> `createChannel` ->
+  `assertExchange`/`assertQueue`/`bindQueue` x3 for the main/retry/DLQ
+  topology -> `prefetch` -> `consume`) before the new channel's
+  `consume()` is actually invoked. The test's first synchronization
+  attempt counted a fixed 4 `await Promise.resolve()` ticks -- fewer
+  than that real chain needs -- so the assertion ran before resubscribe
+  had actually finished. A test-only race, not a production defect.
+- **Fix** (test-only,
+  `apps/worker/src/__tests__/unit/consumerResubscribe.test.ts`):
+  replaced the 4 fixed ticks with a small `waitForCondition()` helper
+  that polls (5ms interval, 2s timeout) on the actual observable
+  outcome already being asserted -- a second connection existing and
+  its channel's `consume()` having genuinely been called -- using real
+  `setTimeout` so Node fully drains the microtask queue between
+  checks. No production file (`consumer.ts` or either app's
+  `queue/connection.ts`) was touched. The suite's other test (the
+  backoff/retry path) was already passing and was left unchanged.
+- **Verification:** rerun on the same real Windows environment --
+  `apps/worker`: **4 suites passed, 15 tests passed**, including both
+  `connectionRecovery.test.ts` and `consumerResubscribe.test.ts`.
+
+**Real RabbitMQ chaos test (the authoritative evidence this phase
+needed):** performed against the actual Docker Compose stack, per the
+13-step procedure specified for this validation round. Reported
+result:
+
+- RabbitMQ container was actually stopped, then started again and
+  returned healthy.
+- The API process and the worker process were **not** restarted at
+  any point.
+- Pre-outage job `162a5260-01f9-49ea-add4-836a64b0ee6d` --
+  `status = COMPLETED`, `attempt_count = 1`.
+- Post-recovery job `4154b2c4-14ee-44e7-8c85-b61effe30eff` --
+  `status = COMPLETED`, `attempt_count = 1`.
+- `GET /api/stats` after recovery: `pendingOutboxEvents = 0`.
+- The API remained available throughout the outage/recovery.
+
+**Why this is real evidence of the actual fix, not the "Deliberate
+Test 4" false positive documented in Incident 8:** for the pre-outage
+job to have reached `COMPLETED`, the worker must already have had an
+active, cached `channel.consume()` subscription -- and the API's
+outbox dispatcher an already-cached publisher channel -- *before*
+RabbitMQ was stopped. This is not the earlier scenario where no
+channel had ever been cached and a fresh `connect()` trivially
+"worked". A channel that was demonstrably live and in use went through
+the outage, and the post-recovery job still completed, with neither
+process restarted -- that is Incident 8's actual failure scenario (a
+cached connection/channel surviving a broker restart), now recovering
+automatically. This is reasoning from the reported facts, not a claim
+based on directly-observed log lines: the specific structured log
+lines this phase added (`"...invalidating cached connection/channel"`,
+`"...resubscribed after disconnect"`) were not captured or pasted as
+part of this validation round, and this document does not claim they
+were seen in this particular run.
+
+**Full real Jest results (final):** `apps/api`: **18 suites passed,
+82 tests passed**, including `connectionRecovery.test.ts`. `apps/worker`:
+**4 suites passed, 15 tests passed**, including both
+`connectionRecovery.test.ts` and `consumerResubscribe.test.ts` (after
+the test-sync fix above). Both real, both on the user's Windows
+environment -- this closes the "apps/api's real Jest results have not
+been reported" gap flagged earlier in this same validation round.
+
+**What this addendum does NOT claim:** no recovery duration or timing
+was measured or reported, so none is stated here. RabbitMQ's internal
+queue state during the outage was not inspected/reported.
+
+**Updated regression check:** the fix to
+`consumerResubscribe.test.ts` is confined to that one test file --
+`git status`/`git diff --stat` after this addendum's change still show
+exactly the same 3 modified implementation files
+(`apps/api/src/queue/connection.ts`, `apps/worker/src/queue/connection.ts`,
+`apps/worker/src/consumer.ts`) and 3 new test files as before, nothing
+else. No production behavior changed as a result of this fix.
