@@ -4,6 +4,7 @@ import { createJob, getJobById, claimReplay, listRecentJobs } from "../services/
 import { env } from "../config/env";
 import { createRateLimiter } from "../middleware/rateLimiter";
 import { backpressure } from "../middleware/backpressure";
+import { requireApiKey } from "../middleware/auth";
 
 export const jobsRouter = Router();
 
@@ -24,7 +25,13 @@ function sleep(ms: number): Promise<void> {
 // Both middleware run and can short-circuit with a response BEFORE
 // createJob() is ever called -- a 429 or 503 here results in zero
 // database writes, since createJob() is only reached via next().
-jobsRouter.post("/", jobsRateLimiter, backpressure, async (req, res) => {
+// Phase 16: requireApiKey runs FIRST (before rate limiting/backpressure)
+// -- an unauthenticated caller is rejected with 401 before consuming
+// any rate-limit budget or triggering a backpressure-check query,
+// consistent with routing order already used for the
+// rate-limiter -> backpressure -> handler chain (each stage can
+// short-circuit before the next runs).
+jobsRouter.post("/", requireApiKey, jobsRateLimiter, backpressure, async (req, res) => {
   const parsed = createJobSchema.safeParse(req.body);
 
   if (!parsed.success) {
@@ -69,7 +76,10 @@ jobsRouter.get("/:id", async (req, res) => {
 // deliberately NOT subject to backpressure -- see middleware/backpressure.ts
 // and engineering-decisions.md for why gating the recovery path behind
 // the same backlog it is meant to drain would be self-defeating.
-jobsRouter.post("/:id/replay", jobsRateLimiter, async (req, res) => {
+// Phase 16: replay is a state-changing, operator-only action -- MUST
+// require authorization (see docs/security.md). requireApiKey runs
+// before the shared rate limiter, same ordering rationale as above.
+jobsRouter.post("/:id/replay", requireApiKey, jobsRateLimiter, async (req, res) => {
   const parsedId = jobIdParamSchema.safeParse(req.params.id);
   if (!parsedId.success) {
     req.log.warn({ id: req.params.id }, "Malformed job id in replay request");

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ApiError, JobDetail as JobDetailType, replayJob } from "../api/client";
+import { getStoredApiKey, setStoredApiKey, clearStoredApiKey } from "../api/apiKey";
 import StatusBadge from "./StatusBadge";
 
 export default function JobDetail({
@@ -15,7 +16,23 @@ export default function JobDetail({
   const [replayMessage, setReplayMessage] = useState<string | null>(null);
   const [replayError, setReplayError] = useState<string | null>(null);
 
+  // Phase 16: replay is a state-changing, operator-only action gated
+  // behind the API's requireApiKey middleware. If no operator key is
+  // stored yet for this tab, ask for one before attempting the
+  // request -- the simplest UI that still keeps the key out of the
+  // bundle and out of any component's persistent state beyond this
+  // browser tab (see api/apiKey.ts). A 401 response (missing/incorrect
+  // key) clears whatever was stored and asks the operator to retry,
+  // rather than silently failing with no explanation.
   async function handleReplay() {
+    let apiKey = getStoredApiKey();
+    if (!apiKey) {
+      const entered = window.prompt("Enter operator API key to replay this job:");
+      if (!entered) return;
+      apiKey = entered;
+      setStoredApiKey(apiKey);
+    }
+
     setReplaying(true);
     setReplayMessage(null);
     setReplayError(null);
@@ -25,7 +42,10 @@ export default function JobDetail({
       onReplayed();
     } catch (err) {
       if (err instanceof ApiError) {
-        if (err.status === 409) setReplayError("Job is no longer in a replayable state.");
+        if (err.status === 401) {
+          clearStoredApiKey();
+          setReplayError("Unauthorized -- incorrect operator key. Try Replay again to re-enter it.");
+        } else if (err.status === 409) setReplayError("Job is no longer in a replayable state.");
         else if (err.status === 404) setReplayError("Job not found.");
         else setReplayError("Replay failed.");
       } else {

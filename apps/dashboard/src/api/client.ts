@@ -1,3 +1,5 @@
+import { getStoredApiKey } from "./apiKey";
+
 export interface Stats {
   totalJobs: number;
   byStatus: Record<string, number>;
@@ -64,6 +66,15 @@ export function getJob(id: string): Promise<JobDetail> {
   return request<JobDetail>(`/api/jobs/${id}`);
 }
 
+// Phase 16: replay is a state-changing, operator-only action and
+// requires the same "x-api-key" header the API's requireApiKey
+// middleware checks. The key is never embedded in this bundle -- it
+// comes from sessionStorage, entered by the operator at runtime (see
+// components/JobDetail.tsx and api/apiKey.ts).
 export function replayJob(id: string): Promise<{ jobId: string; status: string; replayCount: number }> {
-  return request(`/api/jobs/${id}/replay`, { method: "POST" });
+  const apiKey = getStoredApiKey();
+  return request(`/api/jobs/${id}/replay`, {
+    method: "POST",
+    headers: apiKey ? { "x-api-key": apiKey } : undefined,
+  });
 }
