@@ -1240,3 +1240,97 @@ foreground query just failed," or "PostgreSQL is unreachable" with
 correct, already-decided behaviors for no benefit -- exactly the kind
 of unrelated-component modification this project's guardrails warn
 against.
+
+## Decision: split success from bookkeeping in the worker's message-completion path (Phase 16)
+
+**Context:** the final engineering audit that preceded Phase 16 found
+a real correctness gap in `apps/worker/src/consumer.ts`: the original
+code wrapped both `await processJob(job)` and the follow-up
+`await markCompleted(jobId)` in a single `try` block. If `processJob`
+succeeded but `markCompleted` then threw (e.g. a transient Postgres
+connection drop right after the job's real side effects already ran),
+the single `catch` had no way to tell the two apart -- it classified
+this exactly like a genuine business-logic failure, and could retry or
+even dead-letter a job whose work had already been done.
+
+**Chosen approach:** track success and failure as two explicit,
+separate steps. `processJob()` runs in its own try/catch that only
+sets a `processingSucceeded` flag and captures any error. If it
+succeeded, `markCompleted()` runs in a *second*, independent
+try/catch: success acks normally; failure there requeues via the
+existing backoff-then-nack helper (already built for Phase 15's
+DB-error backoff) and is logged explicitly as "processJob() succeeded
+but markCompleted() failed to record it," never routed through the
+retry-count/dead-letter classification meant for real processing
+failures. Only when `processingSucceeded` is false does the original
+classification logic (retryable vs. exhausted vs. non-retryable) run
+at all.
+
+**Why not just add a broader catch or a flag inside the existing
+single try block:** that would still couple two independently-failing
+operations' error handling together, and would be easy to silently
+regress the next time either code path changes. Separating them into
+two try/catches with an explicit boolean makes the two failure modes
+structurally impossible to conflate, not just correctly handled today
+by convention.
+
+**Verification:** a new test file,
+`apps/worker/src/__tests__/unit/markCompletedFailure.test.ts`, proves
+the specific case this fix targets (`processJob` succeeds,
+`markCompleted` throws -> requeue via backoff, and
+`markRetrying`/`markDeadLettered`/the retry and dead-letter publishers
+are asserted to never have been called) alongside two regression
+guards (the normal success path, and a genuine processing failure
+still being classified and retried as before). Real run from this
+session: 3/3 passed. This does not change `claimJob`'s atomic-claim
+semantics or the idempotency guarantees that already existed --
+requeueing after a `markCompleted` failure is safe precisely because a
+later redelivery re-enters the same atomic claim path (proven
+separately by the new `idempotency.test.ts`).
+
+## Decision: single VPS + Docker Compose + Caddy for public deployment, not a managed database, serverless platform, or Kubernetes (Phase 16)
+
+**Context:** the master finalization brief asked for an actual public,
+production-oriented deployment, while explicitly ruling out
+Kubernetes, Kafka, Redis, a service mesh, or any infrastructure added
+for its own sake, and explicitly preferring no cold starts and
+everything colocated in one region.
+
+**Options considered:**
+- *Managed Postgres + managed RabbitMQ/queue + serverless API/worker
+  compute.* Rejected: adds real monthly cost and provider-specific
+  operational surface (IAM, network peering, cold starts on
+  serverless compute) to solve a problem this project doesn't have.
+  Running Postgres and RabbitMQ ourselves, safely, through real
+  failures, was the explicit point of Phases 1-15 -- swapping that out
+  for a managed service at the finish line would undercut the
+  project's own stated learning goals, not just add unneeded
+  infrastructure.
+- *Kubernetes.* Rejected outright per the brief's explicit rule; would
+  also be solving a scaling/orchestration problem this single-region,
+  single-operator system does not have.
+- *Single VPS + Docker Compose, all services colocated, Caddy as a
+  TLS-terminating reverse proxy in front of only the dashboard's
+  published port.* **Chosen.** Matches every stated constraint: no
+  cold starts, one region, minimal new infrastructure (a reverse proxy
+  most of this project's Docker/Compose work already prepared it for),
+  and it is the natural continuation of the `docker-compose.prod.yml`
+  topology already built in this same phase (Postgres/RabbitMQ with no
+  published ports, dashboard nginx as the sole public entry point).
+
+**Why Caddy specifically, over nginx+certbot or a manual TLS setup:**
+Caddy issues and renews Let's Encrypt certificates automatically with
+a Caddyfile of a few lines, removing an entire class of
+certificate-expiry incident for a single-operator project with no
+dedicated ops rotation to watch for it. This is not a new architectural
+component competing with the existing nginx (which stays exactly where
+it is, serving the dashboard's static build and reverse-proxying
+`/api`/`/ws` internally) -- Caddy only replaces where TLS termination
+and the public port would otherwise have to be handled manually.
+
+**Not yet executed:** this decision produced the target architecture
+and the Docker/Compose work to support it (`docs/deployment.md`), but
+an actual VPS account and a real domain are required to provision and
+point at, and both can only come from the project owner. This decision
+record exists so the *reasoning* is captured even though the
+deployment itself is still pending that external input.

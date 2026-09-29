@@ -46,11 +46,29 @@ attempt_count, max_attempts, last_error, created_at, updated_at)
 Liveness check. Returns `{ "status": "ok" }`.
 
 ## Not yet implemented
-- `GET /api/jobs` (list/filter)
-- `POST /api/jobs/:id/retry`, `/replay`
-- `GET /api/jobs/:id/attempts`
-- `GET /api/stats`
-- Authentication/authorization
+
+(Corrected during the Phase 16 final audit: this list was stale --
+`GET /api/jobs`, `POST /api/jobs/:id/replay`, and `GET /api/stats` were
+all implemented in later phases and are documented further down in
+this same file. Leaving a contradicted "not yet implemented" list
+standing next to the sections that implement those same endpoints was
+itself a documentation defect, not just an omission.)
+
+- `GET /api/jobs/:id/attempts` -- genuinely still not implemented, by
+  deliberate design: there is no `job_attempts` table (see
+  `docs/engineering-decisions.md`), so there is no per-attempt history
+  to serve. `total_attempt_count`/`replay_count` on `GET /api/jobs/:id`
+  remain the only attempt-related data available, and are explicitly
+  documented as aggregate-only.
+- `POST /api/jobs/:id/retry` -- not planned as a separate manual
+  endpoint. Retry is automatic: a failed, non-exhausted job is
+  requeued by the worker via the RabbitMQ retry queue's TTL+DLX
+  mechanism (see `docs/message-flow.md`), with no operator action
+  involved. `POST /api/jobs/:id/replay` is the one manual,
+  operator-triggered re-queue action this system provides, and it is
+  scoped to `DEAD_LETTERED` jobs only.
+- Authentication/authorization -- still accurate as of this writing.
+  See `docs/security.md` (Phase 16) for the current state and plan.
 
 
 ## POST /api/jobs/:id/replay
@@ -158,9 +176,16 @@ PostgreSQL-backed aggregate operational stats. Does not query RabbitMQ.
   "totalJobs": 123,
   "byStatus": { "QUEUED": 5, "PROCESSING": 2, "RETRYING": 3, "COMPLETED": 100, "DEAD_LETTERED": 10, "FAILED": 3 },
   "totalReplays": 12,
-  "totalAttempts": 245
+  "totalAttempts": 245,
+  "pendingOutboxEvents": 0
 }
 ```
+`pendingOutboxEvents` was added in Phase 10 (transactional outbox) --
+this example was updated during the Phase 16 final audit to include
+it; the field itself has been present in every real response since
+Phase 10, this doc's example JSON had simply never been refreshed to
+show it.
+
 Verified real via seeded-state integration test (2 tests, both passing).
 See observability.md for full field derivation and what this endpoint
 deliberately does not measure.

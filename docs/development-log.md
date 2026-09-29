@@ -2216,3 +2216,141 @@ shell) as part of reconciling this evidence:**
   (`Preset ts-jest not found relative to rootDir`, reconfirmed again
   during this closeout) -- the real 25/25 suite, 107/107 test result
   above came from the user's own environment, exactly as reported.
+
+## Phase 16 -- Master Finalization: correctness hardening, public security baseline, containerization, documentation reconciliation
+
+Triggered by a detailed, explicit "master finalization" brief: take
+DeadLetter from its post-Phase-15 state toward a publicly deployable,
+production-oriented final state, executing real work rather than only
+planning it, and stopping only at genuine external blockers
+(credentials, account access, domain ownership) -- never fabricating
+test, deployment, latency, or security results.
+
+### What this phase actually did
+
+**Correctness hardening (worker completion race).** The final
+engineering audit that preceded this phase identified a real
+correctness gap in `apps/worker/src/consumer.ts`: if `processJob()`
+succeeded but the subsequent `markCompleted()` database write then
+failed (e.g. a transient connection drop), the original code's single
+try/catch treated that as a *processing* failure -- retrying or
+dead-lettering a job whose side effects had already happened. Fixed by
+separating "did the job's own work succeed" from "did we durably
+record that" into two distinct steps: a `markCompleted()` failure
+after a successful `processJob()` now requeues via the existing
+backoff helper and is explicitly logged as a bookkeeping failure, not
+a processing failure -- it never reaches the
+retry/dead-letter classification path meant for genuine job failures.
+Proven by a new test,
+`apps/worker/src/__tests__/unit/markCompletedFailure.test.ts` (3
+tests: the regression-guard happy path, the critical
+markCompleted-fails-after-success case asserting
+`markRetrying`/`markDeadLettered`/the retry and dead-letter publishers
+are never called, and a regression guard that genuine processing
+failures are still classified normally). Real, verified: **3/3 passed**
+(see Verification below).
+
+**Idempotency proof.** A new real-Postgres integration test,
+`apps/worker/src/__tests__/integration/idempotency.test.ts`, drives 2
+and then 3 concurrent simulated deliveries of the same job ID through
+the real `claimJob`/`markCompleted` functions and asserts exactly one
+delivery's side effect actually ran, the rest were safely skipped by
+the atomic claim, and the job's final `attempt_count`/
+`total_attempt_count` reflect exactly one real attempt. The test's own
+comments are explicit that this demonstrates duplicate delivery is
+safely absorbed, not that the system provides exactly-once delivery --
+that distinction was preserved deliberately, per this phase's explicit
+instruction never to claim exactly-once semantics.
+
+**Public security baseline.** DeadLetter had no authentication, no
+CORS policy, no centralized error handler, and no explicit request
+body limit before this phase -- reasonable for a project developed
+entirely against `localhost`, but not for something meant to be
+publicly reachable. Added:
+- API-key authentication (`x-api-key` header) on the two
+  state-changing routes only (`POST /api/jobs`,
+  `POST /api/jobs/:id/replay`); GET routes stay public by design.
+- An explicit CORS origin allowlist (never a wildcard).
+- A centralized Express error handler that never leaks stack
+  traces/SQL/internal paths in production responses.
+- An explicit, configurable JSON body size limit.
+- A production fail-safe in `config/env.ts`: the API refuses to start
+  if `API_KEY` or `CORS_ALLOWED_ORIGINS` is unset while
+  `NODE_ENV=production`.
+- Dashboard-side: the operator's API key is entered at runtime and
+  held only in `sessionStorage`, never baked into the built bundle.
+
+See `docs/security.md` (new) for the full writeup, including what was
+deliberately left out of scope and why.
+
+**Containerization.** Added `Dockerfile`s for all three apps
+(multi-stage: a build stage with devDependencies to run `tsc`/`vite
+build`, a slim non-root production stage), a root `.dockerignore`, and
+a new `infra/docker-compose.prod.yml` that is deliberately separate
+from the existing local-dev `infra/docker-compose.yml` (which was left
+completely unmodified). In the production topology, Postgres and
+RabbitMQ publish no host ports at all -- the dashboard's nginx
+container is the only public entry point, reverse-proxying `/api` and
+`/ws` to the API service internally. All secrets are read through
+Compose's `${VAR:?required}` fail-fast interpolation. See
+`docs/deployment.md` (new) for the full architecture and the exact
+external blocker (VPS account + domain) preventing an actual live
+deployment right now.
+
+**Documentation reconciliation.** `docs/api.md`'s "Not yet
+implemented" list was stale (listed several already-implemented
+routes); corrected. `docs/testing.md`'s status line and test-structure
+snippet were stale (a Phase-1-era file count never refreshed);
+corrected, including this phase's own new test files.
+`docs/failure-handling.md`'s historical "Known limitations" sections
+were annotated `RESOLVED by Phase 10` / `RESOLVED by Phase 14` where
+later phases had since closed them, without deleting or rewriting the
+original bullets -- they remain the historical record of what the
+system's limitations actually were at the time each was written.
+
+### Verification performed for real, from this session
+
+This session's device-bridge shell (`device_bash`) turned out to run
+in its own isolated sandbox VM, distinct from the project owner's real
+machine -- `docker` is not installed here, and there is no reachable
+Postgres or RabbitMQ (`ECONNREFUSED` on both 5432 and 5672, confirmed
+by direct TCP probe, not a timeout -- nothing is listening). This
+explains, retroactively, why `docker` had never been reachable from
+this session across the entire project, and narrows it further: any
+DB/broker-dependent test, `docker build`, or `docker compose up` needs
+the project owner's own environment, exactly like Phase 15's real
+chaos test and real Jest run did.
+
+What *could* be run for real, from this session, and was:
+
+- `cd apps/api && npx tsc --noEmit` -- PASS.
+- `cd apps/worker && npx tsc --noEmit` -- PASS.
+- `cd apps/dashboard && npx tsc -b --force` -- PASS.
+- `cd apps/api && npx jest --runInBand src/__tests__/unit` -- **7/7
+  suites, 40/40 tests passed** (all DB/broker-independent unit tests,
+  including the new `auth.test.ts`).
+- `cd apps/worker && npx jest --runInBand src/__tests__/unit` --
+  **6/6 suites, 19/19 tests passed** (including the new
+  `markCompletedFailure.test.ts`, 3/3, and the pre-existing
+  `dbErrorBackoff.test.ts` regression guard, still green).
+- Both `infra/docker-compose.yml` and `infra/docker-compose.prod.yml`
+  validated as syntactically valid YAML (`python3 -c "import
+  yaml; yaml.safe_load(...)"`) -- not the same as `docker compose
+  config`, which additionally resolves variable interpolation and
+  build contexts and requires a real Docker daemon.
+
+Not yet run for real: the DB-dependent integration suites (including
+the new `authRoute.test.ts` and `idempotency.test.ts`), a fresh
+full-suite count across both apps, `docker build` for all three
+images, and `docker compose -f infra/docker-compose.prod.yml config`.
+These are queued for the project owner to run on their own machine;
+see `docs/testing.md` for the exact commands, and this entry will be
+updated with the real results once they're reported, never estimated
+or assumed in the meantime.
+
+### Deployment
+
+Not yet done. See `docs/deployment.md` for the target architecture
+(single VPS, Docker Compose, Caddy for TLS) and the exact blocker: a
+VPS provider account and a domain the project owner controls, neither
+of which can be supplied from this session.

@@ -184,6 +184,13 @@ same mechanism verified against COMPLETED and QUEUED.
   sent, and no worker will discover it. Not solved here -- consistent
   with the project's standing decision not to implement an outbox
   pattern without further evidence/need.
+  **RESOLVED by Phase 10:** the transactional outbox closes this gap
+  for both job creation and replay -- the DB state change and the
+  durable record of "this needs to be published" now commit atomically
+  in one transaction. See "Phase 10 -- Transactional Outbox" below.
+  (Annotated during the Phase 16 final audit; this bullet is preserved
+  as the honest historical record of what Phase 6 actually shipped
+  with.)
 - PROCESSING and RETRYING rejection paths were not independently
   exercised with a dedicated test this phase (relying on the shared
   atomic WHERE clause's structural guarantee, verified directly against
@@ -276,9 +283,19 @@ UPDATE) did not affect the staleness-reclaim branch.
 - DB/RabbitMQ dual-write gap on the replay path: reproduced for real,
   not solved (consistent with the project's standing decision not to
   implement an outbox pattern without further evidence/need).
+  **RESOLVED by Phase 10:** see the "Phase 10 -- Transactional Outbox"
+  section below -- this exact gap, reproduced here for real on the
+  replay path specifically, is what Phase 10 was built to close.
 - API RabbitMQ channel does not auto-recover after a broker restart --
   reproduced for real, requires manual API restart. See
   incidents-and-failures.md.
+  **RESOLVED by Phase 14:** see "RabbitMQ connection recovery
+  (Phase 14)" below -- both the API's and worker's connection/channel
+  caching now self-heal after a broker restart or network drop,
+  verified against a real RabbitMQ outage.
+  (Both annotations added during the Phase 16 final audit; the
+  original bullets are preserved unchanged as the honest historical
+  record of what Phase 6 actually found.)
 - Basic replay's intermediate QUEUED/attempt_count=0 state (between the
   replay claim and the worker picking it up) was NOT CAPTURED during
   verification -- the worker consistently claimed faster than

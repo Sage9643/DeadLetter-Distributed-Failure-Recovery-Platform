@@ -495,6 +495,17 @@ via `npm run dev` on the host, no restart policy). A single transient
 Postgres blip therefore took down the entire API or worker process,
 with nothing to bring it back.
 
+(Updated, Phase 16: this describes the *local development* topology,
+which is unchanged -- `infra/docker-compose.yml` still only runs
+`postgres`/`rabbitmq`, API/worker still run via `npm run dev` on the
+host. A separate production topology, `infra/docker-compose.prod.yml`,
+now containerizes the API and worker too, each with its own
+`Dockerfile` and Docker healthcheck/`depends_on: condition:
+service_healthy` gating -- see `docs/deployment.md`. That production
+topology has not yet been deployed anywhere; this incident's fix
+[Phase 15's pool error handling below] is what actually protects both
+topologies, not containerization itself.)
+
 **Problem 2 (previously tracked since Phase 4):**
 `failure-handling.md`'s "Known limitations" and
 `engineering-decisions.md`'s "Split ACK/NACK behavior by failure

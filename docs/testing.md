@@ -1,6 +1,43 @@
 # Testing
 
-## Status: implementation complete, execution PENDING real npm test output
+## Status: real, passing (as of Phase 16's final audit)
+
+(Corrected during the Phase 16 final audit -- this line previously
+read "implementation complete, execution PENDING real npm test
+output" and was stale from an early phase; real execution has existed
+since Phase 12.)
+
+Most recent real, **full** run (Phase 15 closeout, from the project
+owner's own environment, with a live Postgres/RabbitMQ available): API
+19/19 suites, 84/84 tests passed; Worker 6/6 suites, 23/23 tests
+passed; combined 25/25 suites, 107/107 tests passed.
+
+Phase 16 added 4 new test files: API `unit/auth.test.ts`,
+`api/authRoute.test.ts`; worker `unit/markCompletedFailure.test.ts`,
+`integration/idempotency.test.ts`. `npx jest --listTests` now reports
+21 suites for API (up from 19) and 8 suites for worker (up from 6).
+
+**Real, verified evidence for Phase 16's own change set specifically**
+(run from this session's device-bridge shell, which has no reachable
+Postgres/RabbitMQ -- see `docs/engineering-decisions.md` -- so only the
+DB/broker-independent unit suites could be run here):
+
+- API `src/__tests__/unit/*`: **7/7 suites, 40/40 tests passed**,
+  including the new `auth.test.ts` (5 tests).
+- Worker `src/__tests__/unit/*`: **6/6 suites, 19/19 tests passed**,
+  including the new `markCompletedFailure.test.ts` (3/3 -- the
+  verified proof of the Phase 16 worker-completion-race fix in
+  `consumer.ts`) and the pre-existing `dbErrorBackoff.test.ts`
+  regression guard, still green.
+
+**Not yet confirmed from a real run:** the 3 DB-dependent suites added
+or exercised by Phase 16 -- API's `api/authRoute.test.ts` and
+worker's `integration/idempotency.test.ts` (both need a live Postgres)
+-- plus a fresh full combined count across both apps including
+everything above. These require the project owner's own environment,
+exactly like the Phase 15 full-suite run did; see
+`docs/development-log.md`, Phase 16, for whether that has happened by
+the time you're reading this.
 
 ## Framework
 
@@ -14,23 +51,53 @@ requests in-process.
 
 ## Test structure
 
-```
-apps/api/src/__tests__/
-  tsconfig.json                  -- test-only type config (see below)
-  unit/jobSchema.test.ts        -- createJobSchema, jobIdParamSchema
-  integration/jobService.test.ts -- claimReplay concurrency (real Postgres)
-  api/jobsRoute.test.ts          -- supertest route tests
-  helpers/testDb.ts              -- shared pool + safety check + truncate
+(Corrected during the Phase 16 final audit -- the listing below was a
+Phase-1-era snapshot of 4-5 files per app, never refreshed as dozens
+of test files were added across Phases 5-16. This is now the real,
+complete list, grouped by kind rather than narrated file-by-file.)
 
-apps/worker/src/__tests__/
-  tsconfig.json                  -- test-only type config (see below)
-  unit/retryPolicy.test.ts       -- calculateBackoffMs
-  integration/jobService.test.ts -- claimJob concurrency + state-machine
-                                     preconditions (real Postgres)
-  helpers/testDb.ts              -- separate copy; no packages/shared
+```
+apps/api/src/__tests__/            (23 files, 21 suites -- some files
+                                     are shared helpers, not suites)
+  tsconfig.json                    -- test-only type config (see below)
+  helpers/testDb.ts                -- shared pool + safety check + truncate
+  unit/                            -- 7 files: jobSchema, rateLimiter
+                                     (+ concurrency variant), broadcaster,
+                                     connectionRecovery (Phase 14),
+                                     poolErrorHandling (Phase 15),
+                                     auth (Phase 16 -- requireApiKey
+                                     middleware, mocked env)
+  integration/                     -- 10 files: jobService, listRecentJobs,
+                                     changeDetector, statsService,
+                                     backpressure, rateLimiterRoute,
+                                     outboxService, outboxTransaction
+                                     (Phase 10), dispatcher (Phase 10),
+                                     wsServer
+  api/                             -- 4 files: supertest route tests
+                                     (jobsRoute, jobsListRoute, healthRoute,
+                                     authRoute (Phase 16 -- full route-level
+                                     auth gating, real Postgres))
+
+apps/worker/src/__tests__/         (10 files, 8 suites -- tsconfig.json
+                                     and helpers/testDb.ts are not suites)
+  tsconfig.json                    -- test-only type config (see below)
+  helpers/testDb.ts                -- separate copy; no packages/shared
                                      exists yet, duplicating ~15 lines is
                                      not worth introducing one
+  unit/                            -- 6 files: retryPolicy,
+                                     connectionRecovery + consumerResubscribe
+                                     (Phase 14), poolErrorHandling +
+                                     dbErrorBackoff (Phase 15),
+                                     markCompletedFailure (Phase 16)
+  integration/                     -- 2 files: jobService (claimJob
+                                     concurrency + state-machine
+                                     preconditions, real Postgres),
+                                     idempotency (Phase 16 -- duplicate-
+                                     delivery-is-safe proof, real Postgres)
 ```
+
+The exact, current file list is always authoritative over this
+summary -- see each app's `src/__tests__/` directory directly.
 
 Colocated under each app's src/ rather than the top-level tests/
 scaffolding from Phase 0, since each app needs an independently configured
