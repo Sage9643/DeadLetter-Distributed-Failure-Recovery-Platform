@@ -4,14 +4,18 @@
 
 Distributed Failure Capture, Recovery & Event Replay Platform.
 
-Status: Phase 15 — PostgreSQL connection resilience & worker DB-error
-backoff, implemented and validated by a real, sustained PostgreSQL
-outage against the actual Docker Compose stack (worker not restarted,
-backoff observed progressing 1s -> 2s -> 4s -> 8s -> 16s -> 30s capped,
-job completed successfully on recovery), and confirmed by a real Jest
-run (API 19/19 suites/84/84 tests, Worker 6/6 suites/23/23 tests --
-see `docs/development-log.md` for the full, honest validation status).
-Phase 14's RabbitMQ connection recovery remains validated against a
-real RabbitMQ outage on the real Docker Compose stack. See
-`docs/development-log.md` for the full phase-by-phase history and
-`docs/architecture.md` for the current system design.
+Status: Phase 17 — production containerization, security baseline,
+and migration runner validated end-to-end against a real Docker Compose
+production stack (`infra/docker-compose.prod.yml`) on the project
+owner's own machine: all containers healthy, nginx correctly proxying
+`/api` and `/ws` to the API behind the dashboard's single public port,
+API-key auth confirmed (401 without a key), and a real job completing
+end-to-end (API -> Postgres/outbox -> RabbitMQ -> worker -> Postgres).
+**Not yet deployed to the public internet** -- this is local validation
+of the production topology, not a live URL; see `docs/deployment.md`
+for exactly what that still requires. Phase 15's PostgreSQL/RabbitMQ
+chaos resilience and Phase 14's RabbitMQ connection recovery remain
+validated against real outages. See `docs/development-log.md` for the
+full phase-by-phase history, `docs/architecture.md` for the current
+system design, `docs/security.md` for the security baseline, and
+`docs/deployment.md` for the deployment/migration procedure.

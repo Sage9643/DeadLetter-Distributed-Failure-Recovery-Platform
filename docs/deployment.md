@@ -1,21 +1,49 @@
 # Deployment
 
-## Status: not yet publicly deployed
+## Status: production topology validated locally; not yet deployed to a public host
 
-As of this writing, DeadLetter has **not** been deployed to a public
-host. This document records the deployment architecture that was
-designed and built (containerization, the production Compose
-topology, the reverse-proxy/TLS plan) and exactly what is still
-required to complete it. Nothing below should be read as a claim that
-a live URL currently exists -- there isn't one yet, and this file will
-be updated with the real one the moment there is, never before.
+The production Docker Compose topology (`infra/docker-compose.prod.yml`)
+has been run for real, on the project owner's own Windows/Docker
+Desktop environment, and validated end to end (Phase 17):
 
-Why not yet: actually provisioning and reaching a real host requires
-account credentials (a VPS/cloud provider account) and, for a real TLS
-certificate, a domain the operator controls -- both of which only the
-project owner can supply. This is exactly the kind of genuine external
-blocker this project's engineering process is instructed to stop at
-rather than work around or fabricate past.
+- All containers (`postgres`, `rabbitmq`, `api`, `worker`, `dashboard`)
+  started and reported healthy.
+- `dashboard` was confirmed as the only container with a published
+  host port.
+- nginx correctly served the built SPA and reverse-proxied `/api` and
+  `/ws` to the `api` container.
+- `GET /api/health` returned 200.
+- `GET /api/health/ready` returned 200 with both `postgres` and
+  `rabbitmq` reported `"ok"`.
+- API-key authentication was confirmed working: an unauthenticated
+  mutating request returned 401.
+- A real authenticated job, submitted through the public
+  `localhost:8080` entry point, completed successfully through the
+  full path (API -> Postgres/outbox -> RabbitMQ -> worker -> Postgres),
+  with `attempt_count=1`.
+- One real bug was found and fixed by this validation: the dashboard
+  container's own `HEALTHCHECK` used `http://localhost:80/`, but
+  Alpine resolved `localhost` to IPv6 `::1` while nginx listens on
+  IPv4 -- the healthcheck itself was failing even though nginx was
+  completely fine. Fixed to `http://127.0.0.1:80/` (see
+  `apps/dashboard/Dockerfile`).
+
+**What this is not, yet:** this is local validation against Docker
+Desktop, not a public deployment. Nothing above is reachable from the
+internet, there is no real domain, and no TLS certificate has been
+issued. This document will be updated with a real URL the moment one
+exists, and not before. Reaching that point still requires the same
+external blocker as before: a VPS/cloud provider account and a domain
+the project owner controls, neither of which can be supplied from this
+session -- see "What's actually required to complete this" below.
+
+**Known limitation carried forward from local validation, not yet
+re-verified against this topology:** the API key used during this
+local validation round is a real, working credential that has now
+passed through chat/logs and must be treated as compromised for
+production purposes. **It must be rotated (a new, never-shared value
+set for `API_KEY` and `infra/.env.production`'s equivalent) before any
+real public deployment.** See "API key setup and rotation" below.
 
 ## Target architecture
 
@@ -165,3 +193,200 @@ project owner about how much they want to hand over vs. do themselves.
   explanation of this environment constraint). These remain to be run
   by the project owner on their own machine before this is trusted as
   deployment-ready.
+
+## Migration procedure
+
+Schema changes live as plain, additive SQL files in
+`infra/migrations/*.sql` (renamed from `infra/init-db/` in Phase 17 --
+same files, new name reflecting what they actually are now). They are
+applied by `apps/api/src/scripts/migrate.ts`, a small, project-owned
+runner -- not a new ORM/framework dependency. See that file's own
+header comment for the full design rationale; in short:
+
+- A `schema_migrations` ledger table records which files have been
+  applied and when.
+- Files are applied in filename order, each inside its own
+  transaction; a failing file stops the run immediately (nothing later
+  is attempted) and the process exits non-zero.
+- A Postgres advisory lock serializes concurrent runs against the same
+  database.
+- It is idempotent and safe to re-run: already-applied files are
+  skipped via the ledger, and every migration file this project has
+  today is additionally defensive on its own (`CREATE TABLE IF NOT
+  EXISTS` / `ADD COLUMN IF NOT EXISTS`).
+
+**In production** (`infra/docker-compose.prod.yml`): a `migrate`
+service runs this automatically, reusing the `api` image with its
+command overridden to `node dist/scripts/migrate.js`. `api` and
+`worker` both declare `depends_on: migrate: condition:
+service_completed_successfully`, so neither one can start against a
+database that hasn't had pending migrations applied. A redeploy
+(`docker compose -f infra/docker-compose.prod.yml up -d --build`)
+re-runs `migrate` fresh every time; if there is nothing new to apply it
+exits 0 immediately.
+
+**Adding a new migration:** drop a new `NNN_description.sql` file into
+`infra/migrations/` (next number after the highest existing one) and
+redeploy. Nothing else needs to change -- no code references the
+specific file list.
+
+**Why this replaced the previous mechanism:** the original approach
+mounted `infra/init-db/` at Postgres's own
+`docker-entrypoint-initdb.d`, which only ever runs once, against an
+empty data volume. Every deployment after the first would have
+silently never applied a newly added file. This is not a theoretical
+concern -- it already happened twice in this project's own history
+(see `docs/database.md`'s Phase 6 and Phase 10 entries, where the
+schema change had to be applied by hand against the live database
+because nothing else would have run it).
+
+**Verified so far:** the runner's connect-and-fail-fast behavior (no
+`DATABASE_URL` -> exits 1 with a clear message; unreachable database ->
+exits 1 with the real connection error) and its default migrations-
+directory path resolution were verified for real from this session.
+Actually applying it against a real database -- both a fresh one and
+an already-populated one -- has not yet been done from this session
+(no reachable Postgres here; see `docs/engineering-decisions.md`).
+**Exact commands to verify this yourself:**
+
+```
+# Fresh-volume case (new deployment):
+docker compose -f infra/docker-compose.prod.yml up -d
+docker compose -f infra/docker-compose.prod.yml logs migrate
+# Expect: "Applying 3 pending migration(s)" then "Applied 001_...",
+# "Applied 002_...", "Applied 003_...", then "All migrations applied".
+
+# Existing-volume case (this is the case that used to silently break):
+# with the stack already up and initialized, add a harmless no-op
+# migration file, e.g. infra/migrations/004_test_noop.sql containing
+# just `SELECT 1;`, then:
+docker compose -f infra/docker-compose.prod.yml up -d --build migrate
+docker compose -f infra/docker-compose.prod.yml logs migrate
+# Expect: "Applying 1 pending migration(s)" / "Applied 004_test_noop.sql"
+# -- proving a migration added after the volume already had data was
+# picked up and applied, which the old mechanism could never do.
+# Then delete that test file (or leave it -- it's harmless and
+# idempotent either way) and re-run to confirm it reports
+# "Database already up to date".
+```
+
+## Startup procedure
+
+```
+cd infra
+# Fill in infra/.env.production from infra/.env.production.example first.
+docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+docker compose -f docker-compose.prod.yml ps
+docker compose -f docker-compose.prod.yml logs -f migrate api worker dashboard
+```
+
+Startup order is enforced by Compose's `depends_on` conditions, not by
+hoping: `postgres`/`rabbitmq` must report healthy before `migrate`
+runs; `migrate` must exit 0 before `api`/`worker` start; `dashboard`
+has no database dependency and starts independently (it only needs
+`api` to be *starting*, not fully ready, since nginx will simply return
+an upstream error for `/api/*` until `api` itself is ready -- the
+static SPA shell still loads).
+
+## Health checks
+
+- `GET /api/health` -- liveness. Is the API process itself running?
+  Used by the `api` container's own `HEALTHCHECK` and safe to poll
+  frequently.
+- `GET /api/health/ready` -- readiness. Are Postgres and RabbitMQ both
+  currently reachable? Returns 503 (not 200) if either is down -- see
+  `docs/failure-handling.md` for why liveness and readiness are
+  deliberately different checks (Incident 5).
+- Both are reachable through the public entry point at
+  `<dashboard-origin>/api/health` and `<dashboard-origin>/api/health/ready`
+  (nginx reverse-proxies them, same as every other `/api/*` route).
+
+## API key setup and rotation
+
+- Generate a real key with a real source of randomness, e.g.:
+  `openssl rand -hex 32` (or `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+  if `openssl` isn't available).
+- Set it as `API_KEY` in `infra/.env.production` (never committed --
+  see `.gitignore`). The API refuses to start in production without it
+  (`apps/api/src/config/env.ts`).
+- The dashboard never stores this key anywhere persistent on its own:
+  the operator enters it once per browser tab via a prompt, held only
+  in `sessionStorage` (see `docs/security.md`). There is nothing to
+  update on the frontend when the key rotates.
+- **To rotate:** set a new value for `API_KEY` in
+  `infra/.env.production`, then `docker compose -f
+  docker-compose.prod.yml up -d api` to restart just the `api`
+  container with the new value. The old key stops working immediately
+  (there is no grace period/overlap -- a single shared secret, by
+  design, has no concept of two simultaneously valid keys). Any
+  operator with the dashboard open will need to re-enter the new key
+  on their next mutating action (the 401 response already triggers
+  this -- see `apps/dashboard/src/components/JobDetail.tsx`).
+- **Rotate immediately if a key is ever exposed** (shared in chat,
+  logs, a screenshot, committed by accident, etc.) -- exactly the
+  situation from this project's own Phase 17 local validation round,
+  where the key used has been exposed and must be treated as
+  compromised. It was never a production deployment's key (no public
+  deployment has happened yet), but the same rotation step applies
+  before any real deployment uses it.
+
+## Rollback considerations
+
+- **Application code:** `docker compose -f docker-compose.prod.yml up
+  -d --build` with a previous Git commit checked out rebuilds and
+  restarts `api`/`worker`/`dashboard`/`migrate` from that commit.
+  Standard Docker Compose redeploy, nothing project-specific.
+- **Schema:** this project's migration runner is deliberately
+  forward-only (see its header comment and `docs/engineering-
+  decisions.md` -- no down-migrations, matching the "smallest thing
+  that solves a demonstrated problem" scope this project holds itself
+  to). Every migration so far is additive (new table, new
+  nullable/defaulted column) and safe to leave in place even if the
+  application code that used a new column is rolled back -- an unused
+  extra column is harmless. A rollback that needed to actually remove
+  a column or table would be a manual, deliberate `psql` operation
+  against the live database, not something this runner automates; none
+  of this project's migrations have needed that yet.
+- **Data:** `postgres_data`/`rabbitmq_data` are named Docker volumes,
+  never deleted by any command in this project's documented procedures
+  (`stop`/`start`/`up -d`/`up -d --build` all leave volumes untouched;
+  only an explicit `docker compose down -v`, which nothing here ever
+  instructs running against a real deployment, would remove them). A
+  real backup/restore procedure for `postgres_data` (e.g. `pg_dump` on
+  a schedule) has not been built -- this is a genuine, named gap for a
+  real production deployment, not something to claim is handled.
+
+## Verification scripts (Phase 17)
+
+Three scripts, all under `apps/api/scripts/`, written to be run against
+a real running `docker-compose.prod.yml` stack (none of them could be
+executed from this session -- no Docker/reachable Postgres/RabbitMQ
+here, see `docs/engineering-decisions.md`). Each is self-contained
+(plain Node, using only dependencies already installed for `apps/api`)
+and prints real pass/fail evidence rather than assuming success.
+
+```
+DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/verify-ws.js
+DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/verify-latency.js
+DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/verify-chaos.js
+```
+
+- `verify-ws.js`: opens a real WebSocket to `/ws` through nginx,
+  creates a real job through the same public origin, and asserts a
+  real `job.updated` broadcast is received for that exact job ID.
+- `verify-latency.js`: measures real, repeated request latency
+  (default 50 requests per path) for the liveness endpoint, the
+  readiness endpoint, and authenticated job creation, all through the
+  public nginx path; reports p50/p95/p99. Optionally compares against
+  a direct-to-`api` path if `API_DIRECT_URL` is set (e.g. a
+  temporarily published `api` port).
+- `verify-chaos.js`: stops `postgres` (via `docker compose stop`,
+  never touching the volume), confirms liveness stays up and readiness
+  correctly reports the failure, restarts it, confirms readiness
+  recovers, then submits a real job and confirms the worker actually
+  processes it to completion -- then repeats the same sequence for
+  `rabbitmq`. Aborts immediately, before touching anything, if the
+  stack isn't already healthy at baseline.
+
+Each script's own header comment has the full usage details and exact
+copy-paste commands.

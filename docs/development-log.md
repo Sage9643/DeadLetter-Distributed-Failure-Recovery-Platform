@@ -2354,3 +2354,164 @@ Not yet done. See `docs/deployment.md` for the target architecture
 (single VPS, Docker Compose, Caddy for TLS) and the exact blocker: a
 VPS provider account and a domain the project owner controls, neither
 of which can be supplied from this session.
+
+## Phase 17 -- Production validation continuation: migration safety, WebSocket/latency/chaos verification, security review, key rotation flag
+
+Continuation of Phase 16's master finalization effort, picking up
+after the project owner ran the real production Compose stack
+(`infra/docker-compose.prod.yml`) on their own Windows/Docker Desktop
+environment for the first time.
+
+### Real evidence reported by the project owner (not reproduced by this
+session -- this session has no Docker/reachable Postgres/RabbitMQ, see
+`docs/engineering-decisions.md`)
+
+- Production Compose started successfully; API, PostgreSQL, RabbitMQ,
+  and dashboard all reported healthy.
+- Dashboard confirmed as the only publicly exposed container.
+- nginx correctly served the SPA and reverse-proxied `/api` and `/ws`
+  to the API.
+- `GET /api/health` returned 200.
+- `GET /api/health/ready` returned 200 with both `postgres` and
+  `rabbitmq` reported `"ok"`.
+- API-key authentication confirmed: an unauthenticated mutation
+  returned 401.
+- A real authenticated job, submitted through `localhost:8080`,
+  completed successfully through the full path (API -> Postgres/outbox
+  -> RabbitMQ -> worker -> Postgres) with `attempt_count=1`.
+- A real bug found and fixed on the owner's machine: the dashboard
+  container's `HEALTHCHECK` used `http://localhost:80/`, which Alpine
+  resolved to IPv6 `::1` while nginx listens on IPv4 -- fixed to
+  `http://127.0.0.1:80/`. This session found this same fix already
+  present as an uncommitted change at the start of this phase and
+  folded it into this phase's commit.
+
+### What this phase added
+
+**1. Migration safety (the main finding this phase).** Inspecting
+`infra/docker-compose.prod.yml` and the project's own history
+confirmed a real, previously-undocumented-as-a-production-concern gap:
+the `docker-entrypoint-initdb.d` mount (`infra/init-db/` at the time)
+only ever executes once, against an empty Postgres data volume. Every
+deployment after the first would silently never apply a newly added
+`.sql` file. This had already happened twice in this project's own
+history (`docs/database.md`'s Phase 6 and Phase 10 entries both
+required the schema change to be applied by hand against the live
+database, for exactly this reason) -- not a hypothetical risk.
+
+Fixed with the smallest mechanism that closes the gap without adding a
+migration framework/ORM: `apps/api/src/scripts/migrate.ts`, a
+~150-line runner using the `pg` client already a dependency of
+`apps/api`. A `schema_migrations` ledger table tracks applied files; a
+Postgres advisory lock serializes concurrent runs; each file applies
+inside its own transaction, stopping immediately on failure. Wired in
+as a new `migrate` Compose service (reuses the `api` image, overridden
+`command`) that `api`/`worker` both depend on via `condition:
+service_completed_successfully`. `infra/init-db/` was renamed to
+`infra/migrations/` (same three files, unchanged content -- all three
+were already `IF NOT EXISTS`-defensive, which is why the old mechanism
+never actually produced wrong data, only silently skipped work).
+`.github/workflows/ci.yml` was updated to run the same migration
+runner instead of piping each `.sql` file through `psql` by hand, so
+CI now doubles as this runner's own regression test.
+
+Real, verified from this session: `apps/api tsc --noEmit` clean;
+`npm run build -w apps/api` produces `dist/scripts/migrate.js`; run
+with no `DATABASE_URL` set -> exits 1 with a clear message; run
+against an unreachable database -> exits 1 with the real connection
+error (`ECONNREFUSED`), confirming it reached the connect step, i.e.
+its default migrations-directory path resolution is correct. Actually
+applying migrations against a real database -- both fresh and
+already-populated -- requires the project owner's own environment; see
+`docs/deployment.md`'s "Migration procedure" for the exact commands to
+verify both cases, including the specific existing-volume scenario
+this fix targets.
+
+**2. WebSocket, latency, and chaos verification scripts.** Three new
+scripts under `apps/api/scripts/` (`verify-ws.js`, `verify-latency.js`,
+`verify-chaos.js`), each self-contained (plain Node, no new
+dependencies) and each printing real, timestamped pass/fail evidence
+rather than assuming success. None could be executed against a real
+stack from this session; each was verified for its safe/fail-fast
+behavior instead (correct syntax; clean, non-hanging failure when
+nothing is listening; `verify-chaos.js` specifically confirmed to
+abort before ever touching `docker compose` if the baseline readiness
+check isn't already healthy). See `docs/deployment.md`'s "Verification
+scripts" section for what each one proves and the exact commands to
+run them for real.
+
+**3. Production security review.** Re-verified by direct code
+inspection (not re-deriving from memory): both mutating routes
+(`POST /api/jobs`, `POST /api/jobs/:id/replay`) require
+`requireApiKey`; every GET route (`/api/jobs`, `/api/jobs/:id`,
+`/api/stats`, `/api/health`, `/api/health/ready`) is public,
+unauthenticated, by design; CORS uses an explicit allowlist, never a
+wildcard; the centralized error handler never leaks stack
+traces/internal detail in production; `express.json()` has an explicit
+size limit; `infra/docker-compose.prod.yml` publishes no host port for
+`postgres`, `rabbitmq`, or the new `migrate` service -- only
+`dashboard`; only non-secret placeholder `.env.test`/`.env.example`
+files are tracked by git, `infra/.env.production` is correctly
+git-ignored. `REPLAY_TEST_DELAY_MS` (a test-only artificial delay)
+confirmed to default to 0 and to not be set anywhere in the production
+Compose file. See `docs/security.md` for the full write-up.
+
+**4. API key rotation flag.** The API key used during the project
+owner's real local validation round has passed through chat and must
+be treated as compromised. `docs/security.md` and `docs/deployment.md`
+now both carry an explicit rotation requirement before any real public
+deployment; `docs/deployment.md`'s "API key setup and rotation"
+section gives the exact procedure. This session generated no key and
+did not weaken auth in any way to route around this.
+
+**5. Documentation reconciliation.** `docs/deployment.md`: status
+section updated from "not yet publicly deployed" (still true) to
+reflect the real local production-topology validation, plus new
+Migration procedure / Startup procedure / Health checks / API key
+setup and rotation / Rollback considerations / Verification scripts
+sections. `docs/testing.md`: the historical manual `psql`-piping
+sequence for setting up `deadletter_test` is preserved as historical
+record but marked superseded by the new migration runner, with the
+current correct command. `docs/architecture.md`: the CI/CD section's
+description of how `deadletter_test` is set up updated to match the
+real `ci.yml` change. `docs/security.md`: rotation note and
+`REPLAY_TEST_DELAY_MS` verification added to Secrets; migrate service
+network-exposure note added. `README.md`: status line updated from a
+stale "Phase 15" to Phase 17's real state, explicit about what is and
+isn't verified.
+
+### Verification performed for real, from this session
+
+- `apps/api tsc --noEmit` -- PASS (including the new `migrate.ts`).
+- `npm run build -w apps/api` -- PASS, produces `dist/scripts/migrate.js`.
+- `node dist/scripts/migrate.js` with no `DATABASE_URL` -- exits 1,
+  clear error message.
+- `node dist/scripts/migrate.js` against an unreachable database --
+  exits 1 with the real `ECONNREFUSED` error (confirms it read
+  `infra/migrations/`'s 3 real files and reached the connect step
+  without error).
+- `node --check` on all three new verification scripts -- clean syntax.
+- `verify-latency.js` against nothing listening -- fails every request
+  cleanly (no crash, no hang), confirming its error-handling path.
+- `verify-chaos.js` against nothing listening -- aborts immediately at
+  the baseline check, before attempting any `docker compose` command,
+  confirming its safety-first ordering.
+- Both `infra/docker-compose.yml` (unmodified) and
+  `infra/docker-compose.prod.yml` (with the new `migrate` service)
+  re-validated as syntactically valid YAML with variable interpolation
+  resolving correctly (`python3 -c "import yaml; yaml.safe_load(...)"`,
+  plus a manual inspection of the parsed `depends_on` structure for
+  `api`/`worker`).
+
+### Not yet verified from this session (queued for the project owner)
+
+- Migration runner applied for real against both a fresh and an
+  already-populated database.
+- `verify-ws.js`, `verify-latency.js`, `verify-chaos.js` run for real
+  against the live stack.
+- A fresh `docker compose -f infra/docker-compose.prod.yml up -d
+  --build` with this phase's changes (the removed `init-db` mount, the
+  new `migrate` service, the renamed `infra/migrations/` directory) --
+  the project owner's prior successful run predates these changes and
+  should be re-verified against them specifically.
+- Full DB-dependent Jest suites for both apps (see `docs/testing.md`).

@@ -127,6 +127,22 @@ platform, which would be solving a problem this project doesn't have.
   git-ignored (see `.gitignore`).
 - `.env.example` files (API/worker/dashboard) document required
   variable names the same way, with placeholder/example values only.
+- **Rotation (Phase 17):** the `API_KEY` used during the real local
+  production-topology validation round has passed through chat and
+  must be treated as compromised -- it is NOT safe to reuse for any
+  real deployment. See `docs/deployment.md`'s "API key setup and
+  rotation" section for the exact rotation procedure. This is a
+  standing reminder, not a one-time note: any key that is ever
+  exposed (chat, logs, a screenshot, an accidental commit) must be
+  rotated before the next real deployment, the same way.
+- `REPLAY_TEST_DELAY_MS` (see `apps/api/src/routes/jobs.ts`) is a
+  TEST-ONLY artificial delay used to widen a race window for one
+  specific concurrency test. It defaults to `0` (disabled) and is not
+  set anywhere in `infra/docker-compose.prod.yml` -- confirmed by
+  inspection during the Phase 17 security review. If it is ever set to
+  a nonzero value outside a test run, the route logs a loud warning
+  ("TEST-ONLY delay active. Do not use in production.") specifically
+  so this cannot happen silently.
 
 ## Network exposure
 
@@ -142,6 +158,14 @@ platform, which would be solving a problem this project doesn't have.
   misconfigure at the application layer to accidentally expose
   Postgres or RabbitMQ publicly), not something enforced only by
   convention.
+- (Phase 17) The `migrate` service, added when the migration runner
+  replaced the old init-only mechanism, also publishes no host port
+  and sits on the same internal network -- it is a one-shot process
+  that exits after applying pending migrations, not something that
+  needs to be reachable from anywhere.
+- Verified by inspection during the Phase 17 security review: every
+  service block in `infra/docker-compose.prod.yml` was checked for a
+  `ports:` key. Only `dashboard` has one.
 
 ## Logging
 
