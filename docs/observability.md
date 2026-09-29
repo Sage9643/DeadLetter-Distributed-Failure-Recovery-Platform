@@ -273,6 +273,63 @@ GET /api/stats now includes pendingOutboxEvents. Interpretation:
   remained pending through 153 real, logged dispatch failures before
   RabbitMQ recovery. See development-log.md for the full walkthrough.
 
+## Phase 12 -- rate limiting and backpressure as observability signals
+
+Two new real, observable rejection signals, both logged and both
+visible in HTTP responses:
+
+- **429 (rate limited):** logged implicitly via the existing pino-http
+  request logger (every response, including 429s, already gets a
+  `"request completed"` log line with statusCode -- no new logging code
+  was added to rateLimiter.ts beyond that). The response itself carries
+  `reason: "rate_limited"` and a real, derived `Retry-After`.
+- **503 (backpressure):** additionally logs a dedicated structured
+  warning (`req.log.warn({ pendingOutboxEvents, threshold }, ...)`) at
+  the moment of rejection, since this is a more operationally
+  significant event than an ordinary rate-limit hit -- it means the
+  system's actual internal backlog (not just one client's request
+  rate) has crossed a threshold. Verified real: this log line fired
+  2,504 times during the Phase 12 k6 scenario's first (synthetic-
+  environment) execution and 2,508 times during the second,
+  authoritative real Windows Docker Compose execution, and was visually
+  confirmed in the API's stdout during both real manual chaos-test
+  runs.
+
+**pendingOutboxEvents (Phase 10 metric) now doubles as the direct input
+to an active admission-control decision, not just a passive dashboard
+number.** This was proven end-to-end for real during the Phase 12
+chaos test: pendingOutboxEvents climbing past 50 during a genuine
+RabbitMQ outage caused real POST /api/jobs requests to start receiving
+503s (observed at request #52, exactly the first request after the
+count reached 51, in both real executions) -- not a simulated
+correlation. (This chaos test has been run twice: first against
+RabbitMQ 3.12 installed directly in a cloud session that could not
+reach Docker Hub, and second, authoritatively, against the project's
+normal Docker Compose RabbitMQ 3.13 container on Windows -- see
+load-testing.md and incidents-and-failures.md, Incident 8, for the full
+record.)
+
+**A real finding from the first chaos-test execution, since found to be
+conditional rather than universal (see Incident 8's "Update"):** in
+that first run, an active backpressure condition triggered by a
+RabbitMQ outage did NOT clear itself when RabbitMQ came back up,
+because of the pre-existing, unfixed Incident 5 limitation (the API's
+cached RabbitMQ channel never reconnects automatically). `GET
+/api/health/ready` continued reporting `"rabbitmq":"error"` for as long
+as the stale channel remained cached, even after `rabbitmqctl
+start_app` had genuinely restored the broker -- this endpoint (Phase 8,
+unmodified) turned out to be an accurate, useful signal for exactly
+this situation in that run: pendingOutboxEvents staying stuck was
+directly explained by health/ready staying red. **In the second,
+authoritative real-Docker-Compose execution, pendingOutboxEvents
+drained on its own without an API restart** -- this document does not
+know, and does not guess, whether health/ready also recovered on its
+own in that run, since that specific detail was not part of the
+evidence recorded for that execution. An operator watching both
+pendingOutboxEvents and health/ready together, not either in isolation,
+remains the recommended diagnostic approach regardless -- see Incident
+8 for the full, still-open question of why the two runs disagree.
+
 ## Known gap, honestly documented
 
 dispatchOutboxBatch's returned `failed` count is currently always 0

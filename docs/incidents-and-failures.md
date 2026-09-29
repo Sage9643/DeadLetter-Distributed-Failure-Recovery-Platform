@@ -513,3 +513,178 @@ error shape (produced by Node's own net module for dual-stack
 connection failures) whose default .message is misleading if not
 specifically handled -- worth knowing generally, not just for this
 project.
+
+## Incident 8 -- Incident 5's failure mode is conditional; the worker exhibits the same pattern (Phase 12 chaos test)
+
+**Date:** 2026-09-28 (Phase 12)
+
+**Environment note:** this chaos test ran against PostgreSQL 16 and
+RabbitMQ 3.12, installed directly in this execution environment via
+`apt-get`, NOT the project's normal `infra/docker-compose.yml` stack
+(RabbitMQ 3.13-management-alpine, postgres:16-alpine, run via
+`docker compose`). This execution environment could not reach Docker
+Hub (a real, confirmed network-policy denial, not an assumption), so
+the containerized stack could not be started. The same
+users/database names/credentials/queue topology
+docker-compose.yml specifies were configured by hand, and the
+behavior described below is believed equivalent -- but this specific
+run is NOT evidence about the normal Docker Compose RabbitMQ 3.13
+environment, only about this substitute one. Re-running this same
+chaos test against the real containerized stack, to confirm the result
+transfers, remains an open follow-up. See load-testing.md and
+development-log.md's Phase 12 entry for the same note in context.
+
+**Summary of what this incident does and does not claim** (all restated
+in more detail below, and cross-referenced against load-testing.md's
+full chaos-test walkthrough):
+- RabbitMQ was genuinely stopped (`rabbitmqctl stop_app`), not
+  simulated.
+- The real outbox backlog (pendingOutboxEvents) genuinely accumulated
+  while RabbitMQ was down, climbing from 0 to 51 across 51 real
+  accepted job submissions.
+- A real Phase 12 503 backpressure response was genuinely triggered as
+  a direct result (request #52, `pendingOutboxEvents:51`) -- this was
+  not forced or pre-arranged; it is the actual, designed behavior of
+  BACKPRESSURE_THRESHOLD=50 firing under a real backlog.
+- RabbitMQ was then genuinely restarted (`rabbitmqctl start_app`).
+- The existing (Phase 2/10, unmodified) API dispatcher/RabbitMQ
+  connection did NOT self-recover in this particular failure mode (see
+  root cause below) -- this is an EXISTING limitation (Incident 5,
+  Phase 6) that Phase 12's chaos test exposed and reproduced under a
+  new trigger (a real backlog crossing the new backpressure threshold),
+  not a limitation Phase 12 introduced.
+- Restarting the API process restored a fresh RabbitMQ connection and
+  allowed the backlog to drain fully, automatically, within seconds.
+- The worker process independently exhibited the same underlying
+  stale-connection pattern (see below) -- also pre-existing, also not
+  modified or fixed here.
+- **Phase 12 did NOT modify, fix, or otherwise change the worker,
+  dispatcher, or outbox architecture, or either connection.ts file** --
+  confirmed via `git diff` (see the Phase 12 final report).
+- **No exactly-once processing/delivery guarantee, and no automatic-
+  recovery guarantee, is being claimed anywhere in this incident or in
+  Phase 12's documentation.** The system's existing, repeatedly-stated
+  position (see failure-handling.md, engineering-decisions.md) --
+  at-least-once delivery, NOT exactly-once, with this specific recovery
+  path currently manual -- is unchanged and is what this incident
+  reconfirms, not contradicts.
+
+**Trigger:** The Phase 12 backpressure chaos test (see
+load-testing.md) -- a genuine RabbitMQ outage against an API/worker
+pair that had ALREADY been handling traffic successfully (a real job
+had completed end-to-end immediately before the outage began).
+
+**What was expected going in:** Based on Deliberate Test 4 (Phase 10/11,
+above), a RabbitMQ outage followed by restart should result in
+automatic dispatcher recovery -- that test observed `published_at`
+populate within 2 seconds of the next dispatcher tick after RabbitMQ
+became healthy again, with no manual intervention.
+
+**What actually happened this time:** After restoring RabbitMQ
+(`rabbitmqctl start_app`, confirmed via RabbitMQ's own status output),
+`GET /api/health/ready` continued reporting `"rabbitmq":"error"` and
+`pendingOutboxEvents` stayed frozen at 51 for over 20 seconds of
+polling -- the dispatcher did NOT recover automatically this time,
+contradicting the Deliberate Test 4 result at first glance.
+
+**Root cause, reconciling both real observations:** Incident 5's
+original root cause (connection.ts's `getChannel()` returns any
+non-null cached `channel` without checking liveness) is correct, but
+its PRACTICAL failure mode is conditional on the cached `channel`
+variable already being non-null at the moment the broker connection
+dies:
+- **Deliberate Test 4's scenario:** the dispatcher's first-ever publish
+  attempt happened DURING the outage (no job had been dispatched by
+  that process before RabbitMQ was stopped). Every `getChannel()` call
+  during the outage hit `amqp.connect()` fresh, which threw before the
+  assignment `connection = await amqp.connect(...)` could complete --
+  so `channel`/`connection` stayed `null` throughout. Once RabbitMQ
+  returned, the next `getChannel()` call's `amqp.connect()` simply
+  succeeded, exactly as it would for any first connection attempt.
+  Genuine automatic recovery, correctly observed.
+- **This test's scenario:** a channel had ALREADY been successfully
+  established and cached (the pre-outage sanity job) before RabbitMQ
+  was stopped. `channel` was non-null when the broker force-closed the
+  connection, so every subsequent `getChannel()` call -- both during
+  the outage AND after RabbitMQ's restart -- returned the SAME stale,
+  dead `Channel` object (`if (channel) { return channel; }`, no
+  liveness check), which synchronously throws `IllegalOperationError:
+  Channel closed` on every `.publish()` call. Restoring RabbitMQ has no
+  effect on this: nothing ever re-evaluates whether the cached object
+  is still usable.
+
+Both results are real and both are correctly explained by the same root
+cause in connection.ts -- they differ only in whether a live channel
+happened to be cached at the moment of failure, which depends on
+incidental test sequencing, not on anything about RabbitMQ's actual
+state. In a long-running production API, a channel is almost always
+already cached (successful traffic is the normal case), so THIS test's
+scenario -- not Deliberate Test 4's -- is the realistic one to expect
+in practice.
+
+**New, related observation (worker side, not previously documented):**
+the worker process exhibited the same class of failure independently.
+`apps/worker/src/queue/connection.ts` has an identical cache-without-
+liveness-check pattern. The worker process itself silently exited
+during the outage (no crash log line was written before it stopped --
+the process simply ended), and `rabbitmqctl list_queues` confirmed 52
+messages sitting `ready` with `0 consumers` even after the API's
+dispatcher had successfully republished all of them post-recovery.
+Restarting the worker process resolved this immediately.
+
+**Recovery (both times, real):** a process restart (API, then worker)
+is what actually resolved each side -- consistent with Incident 5's
+already-documented "Current mitigation: None automated. Manual API
+process restart is the only recovery path currently available," now
+additionally confirmed to apply to the worker process as well.
+
+**Update -- a second real chaos-test execution produced the opposite
+dispatcher-recovery result:** This chaos test was re-run once more,
+later, against the project's real Docker Compose infrastructure
+(PostgreSQL 16, RabbitMQ 3.13-management-alpine, on Windows; against
+the same `deadletter` database as the first execution, not
+`deadletter_load` -- see load-testing.md, "Execution 2"). The setup matched this incident's
+scenario in the relevant respect: a channel had already been used
+successfully (jobs had been accepted and completed) before RabbitMQ
+was stopped, so a channel was cached going into the outage, not the
+Deliberate-Test-4 scenario. **In this execution, after RabbitMQ was
+restarted, pendingOutboxEvents drained automatically (51 -> 31 -> 0)
+without an API process restart.**
+
+This is a real result, and it is NOT explained by the root-cause theory
+above, which predicts that once a channel is cached at the moment of
+failure it stays permanently stale until a process restart, regardless
+of RabbitMQ's actual state. Two real executions, both with a channel
+cached at the moment of outage, produced opposite dispatcher-recovery
+outcomes. Possible explanations -- none of them confirmed, all
+speculative -- include a difference in exactly which error/close event
+fired on the underlying amqplib connection object between a
+`rabbitmqctl stop_app`/`start_app` cycle (Execution 1) and however
+RabbitMQ was actually stopped/restarted via Docker in Execution 2
+(exact command not recorded in the evidence handed to this
+documentation pass), or a difference in amqplib's own event behavior
+against RabbitMQ 3.12 versus 3.13. **This document does not adopt any
+of these explanations -- it records only that the two real, observed
+outcomes disagree**, which means the dispatcher's self-recovery
+behavior is conditional and not yet fully understood, not simply
+"broken" or "fixed." No change has been made to connection.ts or the
+dispatcher to investigate or resolve this, per the Phase 12 scope
+guard. This remains an open item for a future phase.
+
+The worker's consumer did NOT self-recover in either execution and
+required a restart both times -- that part of this incident is
+unaffected by this update.
+
+**Not fixed in Phase 12.** Per the explicit Phase 12 scope guard, no
+change was made to either connection.ts file, and no reconnection
+logic was added anywhere. This incident is documented, not remediated.
+
+**Engineering lesson:** a single successful reproduction of "outage
+then recovery" is not sufficient evidence that a recovery path is
+reliable -- the SAME root cause can produce different observable
+outcomes depending on incidental state (here: whether a channel was
+already cached) at the moment of failure. The more realistic case
+(cached channel breaks and stays broken) was only surfaced by
+deliberately reproducing the outage a second time, in a different
+process state, rather than trusting the first successful result as
+general proof.

@@ -467,6 +467,218 @@ Scenarios A, B, C, D, and E have all been implemented and executed
 with real, captured evidence. No further load-testing scenarios are
 currently planned under the original Phase 11 design.
 
+## Phase 12 -- Rate Limiting & Backpressure
+
+### Chaos test: real RabbitMQ outage against a live API/worker pair
+
+Purpose: observe, without forcing or fabricating any result, whether a
+genuine RabbitMQ outage pushes pendingOutboxEvents past
+BACKPRESSURE_THRESHOLD (50) and produces real 503 responses, and
+whether the system recovers once RabbitMQ is restored.
+
+This test has now been executed twice, in two different environments.
+Both executions are real -- no fabricated or estimated numbers in
+either -- but they are not interchangeable: **Execution 2, against the
+project's actual Docker Compose infrastructure, is the authoritative
+record going forward.** Execution 1 is retained below rather than
+deleted because it surfaced a real, still-relevant finding, and because
+the two runs disagree on one specific point (whether the API
+dispatcher self-recovers) -- that disagreement is itself a real,
+documented finding; see Incident 8.
+
+#### Execution 1 (synthetic/host-installed environment -- historical, first execution)
+
+Setup: API and worker run as real local processes (`node dist/index.js`,
+not containerized) against the `deadletter` development database and a
+real, locally-installed RabbitMQ broker. **This environment deviation
+existed only for this first execution:** the cloud session that ran it
+could not reach Docker Hub to run the project's usual postgres/rabbitmq
+containers (see incidents-and-failures.md), so PostgreSQL 16 and
+RabbitMQ 3.12 were installed directly and configured with the same
+credentials/topology docker-compose.yml specifies -- behaviorally
+intended to be equivalent, not containerized. Every number below is
+real, from this run, in that environment.
+
+**Sequence actually executed:**
+1. Confirmed clean baseline: `{"pendingOutboxEvents":0}`, empty queues.
+2. `rabbitmqctl stop_app` -- genuine broker shutdown (not simulated).
+   `GET /api/health/ready` immediately confirmed real:
+   `{"postgres":"ok","rabbitmq":"error"}`.
+3. Submitted jobs one at a time via real `POST /api/jobs`, polling
+   `GET /api/stats` after each. Requests 1-51 all returned `201`, with
+   `pendingOutboxEvents` climbing 1, 2, 3, ... 51 in lockstep. **Request
+   52 was the first rejection:** `503`, body
+   `{"error":"Service temporarily unable to accept new jobs","reason":"backpressure","pendingOutboxEvents":51}`,
+   `Retry-After: 5`.
+4. Confirmed real dispatch failures in the API's own log throughout:
+   real `IllegalOperationError: Channel closed` from amqplib, with
+   `stackAtStateChange` showing RabbitMQ's own
+   `CONNECTION_FORCED - broker forced connection closure with reason 'shutdown'`.
+5. `rabbitmqctl start_app` -- genuine broker restart.
+   `GET /api/health/ready` was polled for 20+ seconds afterward: it
+   **continued reporting `"rabbitmq":"error"`**, and
+   `pendingOutboxEvents` **stayed at 51, not draining**. In this run,
+   the API's cached RabbitMQ channel object never reset to null on its
+   own.
+6. Restarting the API process resolved it: within seconds,
+   `pendingOutboxEvents` began dropping in real time (`51 -> 41`
+   observed 3 seconds after restart) and reached `0` within ~15
+   seconds.
+7. The worker process had also silently exited during the outage.
+   Restarting the worker process resolved this immediately -- all 52
+   jobs reached `COMPLETED` within seconds.
+
+**Result: pendingOutboxEvents genuinely exceeded 50 and real 503
+responses appeared.** In this run, neither the API's dispatcher nor the
+worker's consumer self-recovered when RabbitMQ returned -- both
+required a process restart.
+
+#### Execution 2 (real Windows Docker Compose environment -- authoritative)
+
+Setup: PostgreSQL 16 and RabbitMQ 3.13-management-alpine, both running
+as the project's real, unmodified Docker Compose containers on
+Windows (`infra/docker-compose.yml`), API and worker processes pointed
+at that real infrastructure. **This chaos test ran against the
+project's normal `deadletter` database -- not `deadletter_load`, which
+is a separate, isolated database used only for the k6 scenario below.**
+RabbitMQ was stopped (via Docker) while the API process was running.
+
+**Real result:**
+- Jobs were submitted until 51 were accepted and `pendingOutboxEvents`
+  reached 51.
+- The 52nd submission was rejected with:
+  ```json
+  {"error":"Service temporarily unable to accept new jobs","reason":"backpressure","pendingOutboxEvents":51}
+  ```
+  `Retry-After: 5`, verified -- matching Execution 1's
+  threshold-crossing behavior exactly.
+- After RabbitMQ was restarted, `pendingOutboxEvents` **drained
+  automatically: 51 -> 31 -> 0. The API did NOT require a process
+  restart for outbox publication to recover.** This directly
+  contradicts Execution 1's finding on this specific point.
+- During this recovery the **worker process was not running**, so the
+  51 now-republished messages sat `ready` in RabbitMQ until the worker
+  was started. Once started, all 51 were consumed and completed.
+- Recovery completed successfully: all 51 outage-created jobs, in the
+  `deadletter` database, reached `COMPLETED`. (The separately-reported
+  `totalJobs: 172` figure under the k6 results below belongs to the
+  different, isolated `deadletter_load` database used for that
+  scenario -- it is 20 pre-existing jobs plus the 152 jobs the k6 run
+  itself created, and has no relationship to this chaos test's 51 jobs
+  in `deadletter`. See the k6 section below for that reconciliation.)
+
+**What this means for Incident 5 / Incident 8:** the API dispatcher's
+self-recovery behavior is now confirmed, by two real runs, to be
+**conditional, not fixed** -- Execution 1 (self-recovery did not occur)
+and Execution 2 (self-recovery did occur) are both real, both against
+a genuine RabbitMQ outage, and disagree with each other. This is
+consistent with Incident 8's own title ("Incident 5's failure mode is
+conditional") and strengthens rather than overturns it: it is not yet
+known what specific timing or channel-cache state determines which
+outcome occurs, and no code change has been made to
+`apps/api/src/queue/connection.ts`, the dispatcher, or any other
+protected component to force one outcome, per the Phase 12 scope
+guard. The worker's consumer, in both runs, did NOT self-recover and
+required a restart -- this part is consistent across both executions.
+See incidents-and-failures.md, Incident 8, for the full record.
+
+### k6 scenario: rate-limit-backpressure.js
+
+Configuration: `tests/load/k6/scenarios/rate-limit-backpressure.js`,
+20 VUs, `constant-vus` executor, 20 second duration, each VU using its
+own `X-Test-Client-Id` (`k6-vu-<VU id>`) so 20 independent 100-req/60s
+rate-limit buckets are exercised, against `deadletter_load` (the
+existing Phase 11 database-isolation convention).
+
+This scenario has also been executed twice. **Execution 2, below,
+against the real Windows Docker Compose environment, is authoritative.**
+Execution 1's numbers are retained for historical record only and must
+not be cited as current evidence of system behavior.
+
+#### Execution 1 (synthetic/host-installed environment -- historical)
+
+Ran against host-installed PostgreSQL 16 / RabbitMQ 3.12 (see
+Execution 1 of the chaos test above for why), not the project's Docker
+Compose stack.
+
+- 28,437 total HTTP requests / iterations in 20.0s (~1,421 req/s)
+- 100.00% of the scenario's own checks passed (28,437/28,437)
+- k6's default `http_req_failed` metric: 99.45% (28,281/28,437) --
+  expected, not a failure signal for this scenario (see the note on
+  this metric under Execution 2 below, which applies equally here)
+- Real breakdown: `status_201`: 156, `status_429`: 25,777,
+  `status_503`: 2,504 (156 + 25,777 + 2,504 = 28,437)
+- `http_req_duration`: avg 13.83ms, med 11.18ms, p90 23.2ms, p95
+  29.93ms
+- DB verification (`verifyDb.js rate_limit_backpressure`, against
+  `deadletter_load`): 156 `load_test_rate_limit_backpressure` job rows,
+  156 COMPLETED, 0 pending outbox events, PASS. Independent SQL
+  cross-check: `job_rows=156, outbox_rows=156, pending_outbox=0,
+  jobs_with_multi_attempt=0` -- matches k6's own `status_201` counter
+  exactly.
+
+#### Execution 2 (real Windows Docker Compose environment -- authoritative)
+
+Environment: Windows, Docker Compose, PostgreSQL 16,
+RabbitMQ 3.13-management-alpine (the project's real, unmodified
+`infra/docker-compose.yml`). API and worker running as real processes
+pointed at `deadletter_load`.
+
+**Real k6-reported results:**
+- 5,805 total HTTP requests in 20.0s
+- 100.00% of the scenario's own checks passed (5,805/5,805 -- every
+  response was one of the three explicitly expected outcomes: 201,
+  429, or 503)
+- k6's default `http_req_failed` metric: 97.38% -- **this must not be
+  read as an application failure rate.** k6 only counts non-2xx/3xx
+  responses as "failed" by default; 429 (rate-limited) and 503
+  (backpressure-rejected) are this scenario's own intentional,
+  designed-for outcomes, not errors. The metric that actually matters
+  is the real status-code breakdown below.
+- Real breakdown: **`status_201` (accepted): 152**, **`status_429`
+  (rate limited): 3,145**, **`status_503` (backpressure): 2,508** --
+  152 + 3,145 + 2,508 = 5,805, accounting for every single request.
+- `http_req_duration`: avg 67.07ms, p90 124.49ms, p95 179.39ms, max
+  2.16s.
+
+**Independent DB verification** (`verifyDb.js rate_limit_backpressure`,
+against `deadletter_load`):
+```
+Total load_test_rate_limit_backpressure jobs found: 152
+COMPLETED: 152
+Still-pending outbox_events rows: 0
+PASS
+```
+`status_201` (152) matches the DB row count (152) exactly -- direct,
+real confirmation of the core Phase 12 invariant at load-test volume:
+every accepted (201) request produced exactly one job row, every one
+of those 152 jobs reached COMPLETED, and every associated outbox event
+was eventually published (0 pending). Every one of the 5,653 rejected
+(429/503) requests produced zero rows.
+
+**Database separation (reconciled):** the chaos test above (Execution
+2) and this k6 scenario run against two different, deliberately
+isolated databases -- the chaos test uses the project's normal
+`deadletter` database, this k6 scenario uses `deadletter_load` (the
+existing Phase 11 database-isolation convention). The chaos test's 51
+outage-accepted jobs live in `deadletter` and are entirely separate
+from this scenario's 152 `load_test_rate_limit_backpressure` jobs in
+`deadletter_load`. `deadletter_load`'s final `totalJobs: 172` is simply
+20 pre-existing jobs plus these 152 k6-created jobs -- it does not, and
+should not, include the chaos test's 51 jobs from the other database.
+
+**Threshold validation:** RATE_LIMIT_CAPACITY=100/WINDOW=60s and
+BACKPRESSURE_THRESHOLD=50 are validated, by both k6 executions and by
+the chaos test, as real, reachable thresholds under genuine load and
+under a genuine RabbitMQ outage -- neither number is a purely
+theoretical default. Whether these specific numbers are correct for a
+production deployment remains a separate, unanswered question this
+phase does not claim to resolve (see engineering-decisions.md: these
+remain initial defaults, not experimentally-proven production capacity
+numbers). What both executions demonstrate is that the mechanisms
+themselves engage correctly, admit requests correctly below their
+thresholds, and reject correctly above them, with zero unintended side
+effects (no stray DB writes, no duplicate processing).
 
 
 ## Pending

@@ -491,11 +491,15 @@ transient dependency issues that don't actually require a process
 restart. Keeping them separate lets each be used for its correct
 purpose.
 
-**Explicitly NOT a fix for Incident 5:** the RabbitMQ channel still
-does not auto-recover; a 503 from this endpoint would still require a
-manual API restart to actually resolve, exactly as Incident 5
-documented. This endpoint only makes that broken state detectable
-instead of silent.
+**Explicitly NOT a fix for Incident 5:** the RabbitMQ channel's
+auto-recovery behavior is unchanged by this endpoint either way. Two
+real chaos-test executions disagree on whether a stale channel actually
+requires a manual API restart to resolve: the first did, the second
+(authoritative, real Docker Compose) did not -- see
+incidents-and-failures.md, Incident 8, "Update," for the open question
+this leaves. This endpoint only makes the broken/recovering state
+detectable instead of silent; it does not itself fix or guarantee
+either recovery outcome.
 
 ## Decision: processing duration is log-level per-attempt only, not a persisted aggregate metric
 
@@ -716,3 +720,170 @@ overlapping IDs.
 **Trade-off:** None significant at this project's current scale (single
 API process). The mechanism is correct regardless of whether horizontal
 scaling is ever introduced later.
+
+## Decision: in-memory token bucket, not Redis, for Phase 12 rate limiting
+
+**Context:** Rate limiting needs somewhere to store per-client request
+counts. Redis is the conventional choice for a rate limiter meant to
+work across multiple API instances.
+
+**Chosen approach:** A plain in-memory `Map<string, Bucket>` inside the
+single running API process.
+
+**Why:** This project has never run more than one API instance (no
+horizontal scaling anywhere in Phases 0-11, no load balancer, no
+process manager configured for multiple workers). Redis would be new
+infrastructure -- a new service to run, monitor, and reason about --
+solving a scaling problem that does not exist yet. "Use technologies
+only when they solve a real problem" (project brief) applies directly
+here: introducing Redis now would be protecting against a deployment
+topology this system has never had.
+
+**Trade-off, explicitly accepted, not glossed over:**
+- **State loss on API restart.** Every client's bucket resets to full
+  the moment the API process restarts (verified real during the Phase
+  12 chaos test -- after a deliberate process restart, the recovering
+  API's rate limiter had no memory of any client's prior consumption).
+  A client mid-throttle gets a clean slate.
+- **No cross-instance coordination.** If this API is ever run as more
+  than one process, each instance enforces its own independent
+  100-requests/60s budget per client, not one shared budget -- a client
+  could receive up to N times the intended allowance, where N is the
+  instance count. If horizontal scaling is ever introduced, this
+  limiter would need to move to a shared store (Redis or otherwise) at
+  that time -- deferred, not forgotten.
+
+## Decision: backpressure is DeadLetter-specific; rate limiting is not
+
+**Context:** Both Phase 12 middleware protect POST /api/jobs. They
+could have been combined into one middleware, or the backpressure
+concept folded into the same generic rate-limiter abstraction.
+
+**Chosen approach:** Two separate files with deliberately different
+character. `rateLimiter.ts` has zero knowledge of jobs, outbox, or any
+DeadLetter concept -- it is a generic admission-control primitive that
+could be lifted into an unrelated Express project unchanged.
+`backpressure.ts` directly imports `getStats()` and reads
+`pendingOutboxEvents` -- it is meaningless outside this system.
+
+**Why:** These are two genuinely different classes of protection. Rate
+limiting protects against ANY client sending too many requests,
+regardless of system health -- it would make sense even if the outbox
+didn't exist. Backpressure protects against THIS system's actual
+internal backlog, a signal that only exists because of Phase 10's
+outbox design. Conflating them into one middleware would make the
+generic half no longer generic, and would make the system-health half
+harder to reason about in isolation (its own dedicated test file,
+`backpressure.test.ts`, exercises real Postgres-seeded backlog state
+without touching rate-limit token buckets at all, and vice versa for
+`rateLimiter.test.ts`).
+
+## Decision: backpressure applies to POST /api/jobs only, not POST /api/jobs/:id/replay
+
+**Context:** Both routes write an outbox_events row (createJob and
+claimReplay both call insertOutboxEvent inside their transaction, per
+Phase 10). Backpressure could structurally have been applied to both.
+
+**Chosen approach:** Backpressure checks pendingOutboxEvents and
+rejects with 503 ONLY on POST /api/jobs. POST /api/jobs/:id/replay is
+never rejected for backlog reasons, however high pendingOutboxEvents
+is -- verified real via backpressure.test.ts's dedicated exemption test
+and observed again during the Phase 12 chaos test (a real replay
+request succeeded with 200 while pendingOutboxEvents sat at 51, over
+threshold).
+
+**Why:** Replay is how an operator drains an EXISTING backlog of
+DEAD_LETTERED jobs back into the working system -- it doesn't add new,
+unbounded work the way an unlimited stream of new job creation does; a
+replay only ever re-queues a job that already exists and already
+exhausted its retry budget once. Gating the one operation that recovers
+from backlog behind that same backlog would be self-defeating: exactly
+the moment an operator most needs to replay dead-lettered jobs (system
+under strain, backlog high) is the moment backpressure would refuse
+them.
+
+**Trade-off:** A client could, in principle, drive pendingOutboxEvents
+arbitrarily high via replay alone (each replay adds one outbox event).
+Not mitigated in this phase -- replay traffic still shares the Phase 12
+rate limiter's bucket with create-job traffic, which bounds the RATE of
+replay-driven outbox growth even though backpressure itself does not.
+
+## Decision: getStats() called fresh per request for backpressure, never cached
+
+**Context:** Calling getStats() (one aggregate SQL query, including the
+pendingOutboxEvents subquery) on every single POST /api/jobs request
+adds real per-request latency and database load that a cached value
+computed once every N seconds would avoid.
+
+**Chosen approach:** No cache. `createBackpressureMiddleware()` calls
+the existing, unmodified `getStats()` directly, on every request.
+
+**Why:** A backpressure signal is only useful if it reflects the
+system's CURRENT state. A cached value refreshed every, say, 5 seconds
+would mean the API keeps admitting jobs for up to 5 more seconds after
+the real backlog has already crossed the threshold -- precisely the
+failure mode backpressure exists to prevent. The measured per-request
+cost of the extra query (see observability.md) was judged acceptable
+against that correctness gap; if this ever becomes a real bottleneck at
+higher sustained throughput, a short-lived cache with an explicit
+staleness bound would be the next thing to measure and consider -- not
+introduced speculatively now.
+
+## Decision: X-Test-Client-Id test-only header for rate-limiter client identity
+
+**Context:** The rate limiter identifies clients by `req.ip` in normal
+operation. Every request generated by the Jest test suite, and by k6
+running from a single host, shares ONE source IP -- without some way to
+assert a distinct identity per simulated client, "separate client
+buckets" behavior (a required, real invariant to test) would be
+impossible to exercise deterministically.
+
+**Chosen approach:** `defaultIdentify()` reads an `X-Test-Client-Id`
+header instead of `req.ip`, but ONLY when `NODE_ENV !== "production"`
+(checked per-request, not at module load). In production, the header is
+read never -- `defaultIdentify()` falls back to `req.ip` unconditionally,
+verified real via a dedicated test that sends two requests with
+different X-Test-Client-Id values but the same real req.ip under
+NODE_ENV=production and confirms the second is rejected as the SAME
+client.
+
+**Why this is not a trust mechanism:** `req.ip` is derived from
+Express's own resolution of the actual TCP connection's remote address
+(trust proxy is false everywhere in this codebase, so `req.ip` is never
+derived from X-Forwarded-For or any other client-supplied header). A
+real external client cannot spoof it. `X-Test-Client-Id`, by contrast,
+is trivially spoofable by design -- any caller can claim to be any
+client. It is a development/test convenience gated entirely by
+NODE_ENV, not a security boundary, and is documented as such directly
+in rateLimiter.ts's own comments.
+
+**Trade-off:** None in production (the header is inert there). In
+non-production environments, anyone with network access to the API
+could bypass their own rate limit by rotating the header value -- an
+explicitly accepted, documented limitation of a dev/test convenience,
+not a production concern.
+
+## Decision: fixed Retry-After (5s) for backpressure, derived Retry-After for rate limiting
+
+**Context:** The rate limiter computes Retry-After from the actual
+token-bucket refill math (how many milliseconds until this specific
+client has >=1 token again). Backpressure could theoretically do
+something similar (e.g. estimate how long until pendingOutboxEvents
+drops below threshold based on recent drain rate).
+
+**Chosen approach:** Backpressure always returns `Retry-After: 5`,
+a fixed value, regardless of how far over threshold pendingOutboxEvents
+currently is.
+
+**Why:** The rate limiter's refill rate is a known, deterministic
+function of its own configuration (capacity/windowSeconds) -- computing
+an exact Retry-After is just arithmetic. The outbox backlog's drain
+rate depends on RabbitMQ's actual reachability and the dispatcher's
+real throughput under real conditions, which cannot be predicted from
+the pendingOutboxEvents count alone (a backlog under a live RabbitMQ
+outage, per the Phase 12 chaos test, does not drain at a predictable
+rate at all -- it does not drain until an operator intervenes, per
+Incident 5). A precise-looking but fabricated estimate was judged worse
+than an honest fixed value. 5 seconds is a reasonable client-retry
+cadence, not a measured drain-time constant -- this is a locked design
+default, not empirically derived.

@@ -368,6 +368,74 @@ async function verifyReplayConcurrency() {
   return true;
 }
 
+// Correctness checks for the Phase 12 rate-limit/backpressure scenario.
+// Verifies ONLY jobs of type 'load_test_rate_limit_backpressure'.
+//
+// Core invariant this scenario is actually about: every job ROW that
+// exists in the database corresponds to a request the API genuinely
+// accepted (201) -- a 429 or 503 response must have created ZERO rows.
+// This function cannot independently see how many 429/503s k6 issued
+// (that lives in k6's own output, reported separately -- see
+// docs/load-testing.md), so it verifies the DB-observable half of that
+// invariant: every row that DOES exist reached a legitimate terminal
+// state, with its outbox event durably published. It does NOT attempt
+// to re-derive or cross-check the exact accepted-request count against
+// k6's own count here -- that comparison is made once, by hand, using
+// both real numbers, when documenting this scenario's results.
+async function verifyRateLimitBackpressure() {
+  const statusResult = await pool.query(
+    `SELECT status, COUNT(*) as count FROM jobs WHERE type = 'load_test_rate_limit_backpressure' GROUP BY status`
+  );
+  console.log("Job status breakdown for load_test_rate_limit_backpressure:");
+  console.table(statusResult.rows);
+
+  const totalResult = await pool.query(
+    `SELECT COUNT(*) as total FROM jobs WHERE type = 'load_test_rate_limit_backpressure'`
+  );
+  const total = Number(totalResult.rows[0].total);
+
+  const completedRow = statusResult.rows.find((r) => r.status === "COMPLETED");
+  const completedCount = completedRow ? Number(completedRow.count) : 0;
+
+  console.log(`Total load_test_rate_limit_backpressure jobs found (rows == accepted/201 requests): ${total}`);
+  console.log(`COMPLETED: ${completedCount}`);
+
+  if (total === 0) {
+    console.log(
+      "FAIL: no load_test_rate_limit_backpressure jobs found. Either the k6 scenario did not run against this database, or nothing has been submitted yet."
+    );
+    return false;
+  }
+
+  const pendingOutboxResult = await pool.query(
+    `SELECT COUNT(*) as count
+     FROM outbox_events oe
+     JOIN jobs j ON j.id = oe.job_id
+     WHERE j.type = 'load_test_rate_limit_backpressure' AND oe.published_at IS NULL`
+  );
+  const pendingOutboxCount = Number(pendingOutboxResult.rows[0].count);
+  console.log(`Still-pending outbox_events rows for these jobs: ${pendingOutboxCount}`);
+
+  if (pendingOutboxCount !== 0) {
+    console.log(
+      `FAIL: ${pendingOutboxCount} outbox_events row(s) for these jobs are still unpublished. Wait longer (dispatcher polls every 2s) and re-run, or investigate if RabbitMQ is unhealthy.`
+    );
+    return false;
+  }
+
+  if (completedCount !== total) {
+    console.log(
+      `FAIL: ${completedCount}/${total} reached COMPLETED, even though all outbox events for this job type are published. A worker may still be processing -- wait and re-run. If no worker is running against deadletter_load, start one first.`
+    );
+    return false;
+  }
+
+  console.log(
+    `PASS: all ${total} load_test_rate_limit_backpressure job ROWS (each one an accepted/201 request) reached COMPLETED, with zero pending outbox events. This does NOT by itself say how many requests were rejected with 429/503 -- see the k6 run's own status_201/status_429/status_503 counters for that.`
+  );
+  return true;
+}
+
 async function resetLoadDatabase() {
   console.log("Resetting deadletter_load: TRUNCATE TABLE jobs CASCADE (also clears outbox_events via FK)...");
   await pool.query("TRUNCATE TABLE jobs CASCADE;");
@@ -398,8 +466,10 @@ async function main() {
     passed = await verifyOutageRecovery();
   } else if (mode === "replay") {
     passed = await verifyReplayConcurrency();
+  } else if (mode === "rate_limit_backpressure") {
+    passed = await verifyRateLimitBackpressure();
   } else {
-    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, outage, replay, reset.`);
+    console.error(`FAIL: unknown mode "${mode}". Valid modes: normal, concurrent, failing, outage, replay, rate_limit_backpressure, reset.`);
     await pool.end();
     process.exit(1);
     return;

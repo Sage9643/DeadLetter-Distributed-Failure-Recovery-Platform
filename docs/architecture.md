@@ -293,6 +293,66 @@ development-log.md for the full walkthrough with real job IDs,
 timestamps, and attempt counts.
 
 
+## Phase 12 -- Rate Limiting & Backpressure
+
+Two new, deliberately separate protective middleware in front of the
+already-proven Phase 5/6/10 core logic. Neither changes any protected
+production component (createJob, claimReplay, claimJob, withTransaction,
+outboxService, dispatcher, worker, RabbitMQ topology, publisher,
+migrations all confirmed byte-identical to the Phase 11 checkpoint --
+see development-log.md's Phase 12 diff inspection).
+
+**Rate limiting** (`apps/api/src/middleware/rateLimiter.ts`): a
+generic, in-memory, per-client token-bucket limiter with zero knowledge
+of jobs/replay/outbox/DeadLetter concepts -- reusable outside this
+project unchanged. ONE shared instance protects both POST /api/jobs and
+POST /api/jobs/:id/replay (one combined budget per client, not two).
+GET routes are never rate-limited.
+
+**Backpressure** (`apps/api/src/middleware/backpressure.ts`): the
+opposite kind of component -- explicitly DeadLetter-specific, reading
+the existing (Phase 8/10, unmodified) getStats()'s pendingOutboxEvents
+field fresh on every request. Applied ONLY to POST /api/jobs; POST
+/api/jobs/:id/replay is deliberately exempt (see
+engineering-decisions.md).
+
+Route order for POST /api/jobs: rate limiter -> backpressure -> the
+existing, unmodified createJob() handler. For POST /api/jobs/:id/replay:
+rate limiter -> the existing, unmodified claimReplay() handler. A 429
+or 503 from either middleware short-circuits the request via Express's
+normal middleware chain (no call to next()) -- createJob()/claimReplay()
+are never reached, and no database write occurs. Verified real via
+backpressure.test.ts and rateLimiterRoute.test.ts (both assert DB row
+counts are unchanged across a rejection), and confirmed at k6 volume
+across two real executions (28,281 real 429/503 rejections in the
+first, synthetic-environment execution; 5,653 in the second,
+authoritative real Windows Docker Compose execution), 0 corresponding
+job rows in either -- see load-testing.md.
+
+**Real interaction discovered with the pre-existing Incident 5
+limitation:** a genuine RabbitMQ outage chaos test has now been run
+twice -- once against PostgreSQL 16/RabbitMQ 3.12 installed directly in
+a cloud session that could not reach Docker Hub (see
+incidents-and-failures.md, Incident 8, for why), and once, later,
+against the project's real, unmodified `docker-compose.yml` stack
+(PostgreSQL 16, RabbitMQ 3.13-management-alpine) on Windows -- the
+second, real-Docker-Compose execution is authoritative. Both real runs
+showed pendingOutboxEvents genuinely climb into backpressure and a real
+503 genuinely fire. **The two runs disagree on one point:** in the
+first execution, once the API's cached RabbitMQ channel went stale
+(Incident 5, unfixed, unmodified in this phase), the resulting backlog
+did NOT self-clear even after RabbitMQ was restored, and required an
+API process restart; in the second, authoritative execution, the
+backlog drained on its own without an API restart. This disagreement is
+real and currently unexplained -- see incidents-and-failures.md,
+Incident 8, for the full record and the open question it leaves. In
+both runs the worker process's own RabbitMQ connection did NOT
+self-recover and needed a restart. This is a real, observed interaction
+with a pre-existing limitation, not a Phase 12 defect, and per the
+explicit Phase 12 scope guard no change was made to connection.ts, the
+dispatcher, or any other protected component to investigate or resolve
+the disagreement.
+
 ## Note on CI/CD (as of Phase 11)
 
 `.github/workflows/` was scaffolded empty in Phase 0 and has never been

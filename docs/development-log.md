@@ -1514,3 +1514,212 @@ Phase 9 commit for consumer.ts, worker's jobService.ts, app.ts,
 publisher.ts, and connection.ts (all unchanged).
 
 Final result: 63/63 tests passing (62 prior + 1 new regression test).
+## Phase 12 -- Rate Limiting & Backpressure: Real Results
+
+**Date:** 2026-09-28
+
+### Environment note
+
+This session ran with direct shell/filesystem execution access to a
+real (if non-containerized) instance of the project -- unlike Phases
+0-11, which were driven entirely by the person pasting back terminal
+output from their own machine. Docker Hub was unreachable from this
+environment (network policy denial -- confirmed via the platform's own
+proxy status endpoint, not assumed), so the usual `docker compose up`
+(postgres:16-alpine, rabbitmq:3.13-management-alpine) could not run.
+PostgreSQL 16 and RabbitMQ 3.12 were installed directly instead
+(`apt-get install postgresql rabbitmq-server`) and configured with the
+same users/databases/credentials docker-compose.yml specifies --
+behaviorally equivalent for this phase's purposes, not a substitute for
+eventually re-verifying against the real containerized stack. k6 was
+not available via apt either; the official v0.55.0 linux-amd64 binary
+was downloaded directly from its GitHub release (GitHub is allowlisted)
+and installed to /usr/local/bin. All test/build/chaos/k6 results in
+this entry are real, actually-executed output from this environment,
+not fabricated or assumed from prior phases.
+
+### What we built
+- apps/api/src/middleware/rateLimiter.ts -- generic, route-agnostic,
+  in-memory per-client token-bucket rate limiter (`createRateLimiter`
+  factory)
+- apps/api/src/middleware/backpressure.ts -- DeadLetter-specific,
+  checks fresh getStats().pendingOutboxEvents against a threshold
+  (`createBackpressureMiddleware` factory)
+- apps/api/src/config/env.ts -- added RATE_LIMIT_CAPACITY (100),
+  RATE_LIMIT_WINDOW_SECONDS (60), BACKPRESSURE_THRESHOLD (50)
+- apps/api/src/routes/jobs.ts -- wired one shared rate limiter into
+  POST / and POST /:id/replay; wired backpressure into POST / only
+- Tests: rateLimiter.test.ts (17 cases), rateLimiter.concurrency.test.ts
+  (5 cases, Promise.all admission-invariant proofs),
+  backpressure.test.ts (6 cases, real seeded Postgres state),
+  rateLimiterRoute.test.ts (3 cases, real route + real DB, including
+  the wall-clock-refill finding below)
+- tests/load/k6/scenarios/rate-limit-backpressure.js -- new k6 scenario
+- tests/load/verify/verifyDb.js -- added verifyRateLimitBackpressure
+  (additive, same assertLoadDatabase() safety pattern as every existing
+  mode)
+
+No file under apps/worker/, no protected apps/api file (jobService.ts,
+outboxService.ts, dispatcher.ts, withTransaction.ts, connection.ts,
+publisher.ts), and no migration was modified -- confirmed via
+`git diff --stat` before finishing (see final report).
+
+### Real test-writing findings (not fabricated, discovered while running the suite)
+
+1. **Backpressure-vs-rate-limit test collision.** The first version of
+   rateLimiterRoute.test.ts tried to send 100 real sequential
+   POST /api/jobs to reach RATE_LIMIT_CAPACITY, but no outbox
+   dispatcher runs against the test `app` (only index.ts starts one).
+   Every request left behind a permanently-unpublished outbox_events
+   row, so BACKPRESSURE_THRESHOLD (50) was crossed and the test started
+   getting real 503s around request 51 -- not the 429s it was trying to
+   test. Fixed by having the test harness mark outbox rows published
+   after each request, simulating the dispatcher's role and correctly
+   isolating rate-limit behavior from backpressure.
+2. **Wall-clock refill makes an exact-boundary assertion flaky by
+   design.** The production rate limiter (routes/jobs.ts) uses the real
+   system clock. The first version of the "capacity admitted, request
+   N+1 is exactly 429" test failed for real: request 101 returned 201,
+   not 429, because ~1-2 tokens had already refilled during the real
+   ~1 second it took to send 100 sequential HTTP+DB requests. Rewrote
+   the test to assert the real invariant instead -- an upper bound on
+   admitted requests derived from measured elapsed wall-clock time,
+   plus the DB-write invariant (job rows == admitted count exactly) --
+   rather than a boundary that can never be exactly pinned down under a
+   continuously-refilling bucket and real time.
+
+Both were real first-run failures, root-caused and fixed, not hidden.
+
+### Real regression results
+apps/api: 17 suites / 78 tests -- PASS (13 suites / 52 tests baseline +
+4 new suites / 26 new tests)
+apps/worker: 2 suites / 11 tests -- PASS, byte-identical to Phase 11
+(confirmed via git diff -- zero apps/worker changes)
+`npm run build` (tsc, noEmitOnError) -- clean, both apps
+
+### Real chaos test: RabbitMQ outage against a live API/worker pair
+
+Full detail in load-testing.md and incidents-and-failures.md
+(Incident 8). Summary: a real `rabbitmqctl stop_app` pushed
+pendingOutboxEvents from 0 to 51 across 51 real accepted POST /api/jobs
+requests; request 52 was the first real 503
+(`{"pendingOutboxEvents":51}`, Retry-After: 5). Restoring RabbitMQ
+(`rabbitmqctl start_app`) did NOT self-heal the backlog -- a real,
+newly-precise finding refining Incident 5: the failure only self-heals
+if no channel was cached before the outage (Deliberate Test 4's case);
+once a live channel IS cached and then dies, it never recovers without
+a process restart (this test's case, and the realistic one for a
+long-running process). The worker independently exhibited the same
+pattern (silent exit, non-recovering consumer, 52 messages stuck
+`ready`/`0 consumers`). Restarting both processes fully recovered the
+system: pendingOutboxEvents drained to 0, all 52 jobs reached
+COMPLETED.
+
+### Real k6 scenario: rate-limit-backpressure.js
+
+20 VUs, 20s, distinct X-Test-Client-Id per VU, against deadletter_load.
+28,437 total requests: 156 accepted (201), 25,777 rate-limited (429),
+2,504 backpressure-rejected (503) -- real k6 Counter output, not
+estimated. `verifyDb.js rate_limit_backpressure` and an independent SQL
+cross-check both confirmed exactly 156 job rows / 156 outbox rows / 0
+pending / 0 multi-attempt jobs, all 156 reaching COMPLETED -- job-row
+count matches the k6 status_201 counter exactly. Full breakdown in
+load-testing.md.
+
+### Anomalies observed outside Phase 12's own scope (flagged, not fixed)
+
+- `node_modules/dotenv@17.4.2` prints a randomized promotional "tip"
+  banner on every `dotenv.config()` call; one of the possible tips
+  reads `⌁ auth for agents [www.vestauth.com]` -- explicitly targeting
+  AI coding agents and pointing at a third-party domain unrelated to
+  dotenv's own project. Confirmed present in the real installed
+  package source (not a hallucination), and it is genuine upstream
+  package output, not anything this project's code does. No URL was
+  visited and no action was taken on it -- treated as untrusted
+  third-party output, per standard practice for anything a dependency
+  prints. Flagged here for awareness; addressing it (e.g. pinning an
+  earlier dotenv version, or passing `{ quiet: true }`) is a separate,
+  out-of-scope decision for the project owner.
+- docs/observability.md's "Known gap, honestly documented" section
+  (dispatchOutboxBatch's failed counter/log line) is stale -- Incident 7
+  in incidents-and-failures.md already documents this as fixed during a
+  Phase 10 corrective pass, and the currently-running dispatcher.ts
+  (read directly, and observed actively logging
+  "Outbox dispatch failed; will retry" 32+ times during this phase's
+  own chaos test) confirms the fix is genuinely in place. Not corrected
+  in this phase (out of the explicit Phase 12 documentation scope) --
+  flagged for the project owner to reconcile.
+- docs/development-log.md had no Phase 11 entry at all before this
+  session, despite docs/load-testing.md documenting Phase 11 Scenarios
+  A-E in full -- an apparent pre-existing gap in this specific file, not
+  something this phase's work caused. Not backfilled here (this session
+  has no first-hand evidence of Phase 11's actual execution to record
+  accurately) -- flagged for the project owner.
+
+
+## Phase 12 -- Real Windows Docker Compose Verification (Closure)
+
+**Date:** 2026-09-29
+
+The Phase 12 chaos test and k6 scenario documented above (dated
+2026-09-28) were both executed a second time, against the project's
+actual Docker Compose infrastructure on the developer's own Windows
+machine (PostgreSQL 16, RabbitMQ 3.13-management-alpine, both real
+Docker containers, `infra/docker-compose.yml` unmodified) rather than
+the cloud session's host-installed PostgreSQL 16/RabbitMQ 3.12
+substitute. **This second execution is the authoritative record going
+forward.** The first execution's numbers above are retained for
+historical record and must not be cited as current evidence.
+
+Real k6 results (Docker Compose environment): 5,805 total requests in
+20s -- 152 accepted (201), 3,145 rate-limited (429), 2,508
+backpressure-rejected (503); 100% of the scenario's own checks passed;
+`http_req_failed` 97.38% (expected -- not an application-failure
+signal for this scenario). `verifyDb.js rate_limit_backpressure`
+against `deadletter_load` confirmed 152 job rows, 152 COMPLETED, 0
+pending outbox events, PASS -- matching the k6 `status_201` counter
+exactly.
+
+Real chaos-test results (Docker Compose environment, against the
+project's normal `deadletter` database -- NOT `deadletter_load`, which
+is the separate, isolated database used only for the k6 scenario
+below): RabbitMQ stopped via Docker while the API was running; 51 jobs
+accepted before the 52nd was rejected with the same
+`{"pendingOutboxEvents":51}` / 503 / `Retry-After: 5` shape as the
+first execution. **Unlike the first execution, pendingOutboxEvents
+drained automatically (51 -> 31 -> 0) after RabbitMQ was restarted,
+with no API process restart required.** The worker process was not
+running during this recovery and needed to be started before the 51
+backlogged messages were consumed; once started, all 51 completed.
+This is a genuine disagreement with the first execution's finding on
+API self-recovery specifically -- both results are real, and the
+disagreement itself is now documented as an open item; see
+incidents-and-failures.md, Incident 8, "Update," for the full record
+and why this document does not attempt to explain it. (The separately-
+reported `totalJobs: 172` figure under the k6 results below is
+`deadletter_load`'s count -- 20 pre-existing jobs plus the 152 jobs the
+k6 run itself created -- and is unrelated to this chaos test's 51 jobs
+in the `deadletter` database; the two databases are isolated and their
+counts are not combined.)
+
+Full real numbers, side-by-side with the first execution, are in
+load-testing.md's "Execution 1" / "Execution 2" subsections under both
+the chaos test and the k6 scenario. docs/architecture.md and
+docs/observability.md were also updated to reflect both executions and
+the Incident 8 disagreement, without deleting the first execution's
+real findings.
+
+Documentation-only change: no application code was modified during
+this closure pass. Build (`tsc`) for both `apps/api` and `apps/worker`
+passed cleanly, both re-run from this session and, separately and
+authoritatively, on the real Windows machine by the project owner.
+**`npm test` was run by the project owner directly on the real Windows
+environment, against this same transferred Phase 12 repository:
+`apps/api` -- PASS; `apps/worker` -- PASS (2 suites / 11 tests).** This
+session's own attempt to run `npm test` independently hit an
+environment-specific limitation (a workspace `node_modules`
+hoisting/symlink resolution gap specific to this session's device
+bridge, confirmed via direct investigation, not assumed) and could not
+reproduce the run itself -- this is a limitation of this Claude
+session's execution environment only, not of the project or of Phase
+12, and does not affect the authoritative test-pass evidence above.

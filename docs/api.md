@@ -258,3 +258,71 @@ publishJobCreated directly. claimReplay now atomically writes the
 DEAD_LETTERED->QUEUED transition and a pending outbox_events row in one
 transaction; the actual RabbitMQ publish happens asynchronously via the
 outbox dispatcher. See architecture.md and engineering-decisions.md.
+
+## POST /api/jobs -- updated (Phase 12: rate limiting + backpressure)
+
+Two new middleware run BEFORE createJob() is ever reached: a rate
+limiter, then a backpressure check. Either can short-circuit the
+request with zero database writes. See engineering-decisions.md for
+why these are separate, route-agnostic-vs-DeadLetter-specific concerns
+rather than one combined middleware.
+
+**Rejected by rate limiter -- `429 Too Many Requests`:**
+```json
+{ "error": "Too many requests", "reason": "rate_limited" }
+```
+Includes a `Retry-After` header (seconds, integer, derived from the
+actual token-bucket refill rate for that client -- not a fixed
+constant). Verified real via rateLimiter.test.ts, rateLimiter.
+concurrency.test.ts, rateLimiterRoute.test.ts (real Express route +
+real Postgres), and the k6 rate-limit-backpressure scenario -- 25,777
+real 429 responses in the scenario's first (synthetic-environment)
+execution, 3,145 in the second, authoritative real Docker Compose
+execution (see load-testing.md).
+
+**Rejected by backpressure -- `503 Service Unavailable`:**
+```json
+{
+  "error": "Service temporarily unable to accept new jobs",
+  "reason": "backpressure",
+  "pendingOutboxEvents": 51
+}
+```
+`pendingOutboxEvents` is the actual value that triggered the rejection
+(a fresh getStats() call, not cached), not the configured threshold.
+`Retry-After: 5` always (fixed, unlike the rate limiter's derived
+value -- see engineering-decisions.md for why a fixed value was judged
+sufficient here). Verified real via backpressure.test.ts (deterministic
+seeded Postgres state, real Express route) and a genuine RabbitMQ
+outage (see load-testing.md's Phase 12 chaos-test section).
+
+Default thresholds (env-configurable, NOT experimentally-proven
+production capacity numbers -- see engineering-decisions.md):
+`RATE_LIMIT_CAPACITY=100`, `RATE_LIMIT_WINDOW_SECONDS=60`,
+`BACKPRESSURE_THRESHOLD=50`.
+
+## POST /api/jobs/:id/replay -- updated (Phase 12: rate limiting only)
+
+Shares the SAME rate-limit bucket as POST /api/jobs (one client's
+create-job and replay traffic draw from one combined budget, not two
+independent ones) -- can now also return `429` with the identical
+shape documented above. Verified real via rateLimiterRoute.test.ts.
+
+Deliberately NOT subject to backpressure -- a replay request can
+succeed (200) even while pendingOutboxEvents is far over threshold.
+Verified real via backpressure.test.ts's dedicated exemption test and
+via manual observation during the Phase 12 chaos test. See
+engineering-decisions.md for why.
+
+## Test-only header: X-Test-Client-Id (Phase 12)
+
+Read by the rate limiter's client-identity logic ONLY when
+`NODE_ENV !== "production"`. Overrides `req.ip` for that request. This
+is NOT a security or trust mechanism -- unlike `req.ip` (derived from
+the actual TCP connection, which Express's default `trust proxy: false`
+never lets a client spoof via headers), this header is trivially
+spoofable by any caller. It exists purely so tests and k6 runs (which,
+run from a single host, would otherwise all share one source IP) can
+exercise per-client rate-limit behavior deterministically. Ignored
+entirely in production -- verified real via rateLimiter.test.ts's
+"production ignoring X-Test-Client-Id" suite.
