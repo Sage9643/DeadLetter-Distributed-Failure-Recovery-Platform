@@ -27,6 +27,18 @@
 # passwords; the API itself refuses to start in production without
 # API_KEY/CORS_ALLOWED_ORIGINS -- see apps/api/src/config/env.ts) --
 # it will not silently run insecurely.
+#
+# Schema/migrations: postgres has NO docker-entrypoint-initdb.d mount.
+# That mechanism only ever runs once, against an empty data volume --
+# on every deployment after the first, a newly added migration file
+# would silently never be applied (this bit this project twice in real
+# history, by hand -- see docs/database.md's Phase 6 and Phase 10
+# entries). The `migrate` service below is the single mechanism for
+# applying infra/migrations/*.sql, whether the volume is brand new or
+# already has data: it is idempotent (a schema_migrations ledger table
+# tracks what has already been applied) and runs before api/worker are
+# allowed to start (`condition: service_completed_successfully`). See
+# apps/api/src/scripts/migrate.ts and docs/deployment.md.
 
 services:
   postgres:
@@ -38,7 +50,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-deadletter}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./init-db:/docker-entrypoint-initdb.d:ro
     networks:
       - internal
     healthcheck:
@@ -68,6 +79,29 @@ services:
     # No `ports:` -- neither the AMQP port nor the management UI (15672)
     # is published. Only api/worker (on `internal`) can reach it.
 
+  migrate:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    # Overrides the api image's default CMD (node dist/index.js) --
+    # same image, different entrypoint, so no separate Dockerfile/image
+    # to build and keep in sync.
+    command: ["node", "dist/scripts/migrate.js"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deadletter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-deadletter}
+      MIGRATIONS_DIR: /app/migrations
+    volumes:
+      - ./migrations:/app/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+    # One-shot: applies pending migrations and exits 0 (or non-zero on
+    # failure, which blocks api/worker from starting -- see below).
+    # Never restarted automatically; a redeploy re-runs it fresh.
+    restart: "no"
+
   api:
     build:
       context: ..
@@ -81,6 +115,8 @@ services:
       API_KEY: ${API_KEY:?API_KEY must be set}
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       rabbitmq:
@@ -102,6 +138,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-deadletter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-deadletter}
       RABBITMQ_URL: amqp://${RABBITMQ_USER:-deadletter}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set}@rabbitmq:5672
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       rabbitmq:

@@ -56,14 +56,20 @@ jobs:
       - name: Build apps/api
         run: npm run build -w apps/api
 
-      - name: Set up deadletter_test database
+      - name: Create deadletter_test database
         env:
           PGPASSWORD: deadletter_dev_password
-        run: |
-          psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/001_create_jobs_table.sql
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/002_phase6_replay_columns.sql
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/003_phase10_outbox_table.sql
+        run: psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
+
+      # Phase 17: real production migration runner, not raw psql piping
+      # -- this is the same mechanism infra/docker-compose.prod.yml's
+      # migrate service runs, so CI is also this script's regression
+      # test.
+      - name: Apply migrations (apps/api/src/scripts/migrate.ts)
+        env:
+          DATABASE_URL: postgresql://deadletter:deadletter_dev_password@localhost:5432/deadletter_test
+          MIGRATIONS_DIR: ${{ github.workspace }}/infra/migrations
+        run: node apps/api/dist/scripts/migrate.js
 
       - name: Test apps/api
         run: npm test -w apps/api -- --runInBand
@@ -117,14 +123,23 @@ jobs:
       - name: Build apps/worker
         run: npm run build -w apps/worker
 
-      - name: Set up deadletter_test database
+      # The worker doesn't own the schema, but its tests need it
+      # applied the same way production does -- build and run the
+      # migration runner that lives in apps/api (see the api job
+      # above for the full rationale).
+      - name: Build apps/api (for the migration runner)
+        run: npm run build -w apps/api
+
+      - name: Create deadletter_test database
         env:
           PGPASSWORD: deadletter_dev_password
-        run: |
-          psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/001_create_jobs_table.sql
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/002_phase6_replay_columns.sql
-          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/003_phase10_outbox_table.sql
+        run: psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
+
+      - name: Apply migrations (apps/api/src/scripts/migrate.ts)
+        env:
+          DATABASE_URL: postgresql://deadletter:deadletter_dev_password@localhost:5432/deadletter_test
+          MIGRATIONS_DIR: ${{ github.workspace }}/infra/migrations
+        run: node apps/api/dist/scripts/migrate.js
 
       - name: Test apps/worker
         run: npm test -w apps/worker -- --runInBand

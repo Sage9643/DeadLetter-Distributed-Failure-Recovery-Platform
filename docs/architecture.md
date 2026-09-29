@@ -375,9 +375,13 @@ own in the Actions UI rather than as one combined pass/fail.
   `apps/api/.env.test` and `apps/worker/.env.test` already expect --
   no workflow-level environment overrides were needed. Each job runs
   `npm ci` at the workspace root, builds its app (`tsc`), creates the
-  `deadletter_test` database and applies `infra/init-db/001`-`003` via
-  `psql` (mirroring the manual setup documented in testing.md exactly,
-  not a new migration mechanism), then runs `npm test -w apps/<app> --
+  `deadletter_test` database, and applies `infra/migrations/*.sql` by
+  building and running `apps/api/src/scripts/migrate.ts` (Phase 17 --
+  previously this piped each `infra/init-db/*.sql` file through `psql`
+  by hand; CI now exercises the exact same migration runner that
+  `infra/docker-compose.prod.yml`'s `migrate` service runs in
+  production, so a broken migration fails CI before it could ever reach
+  a real deployment), then runs `npm test -w apps/<app> --
   --runInBand`.
 - **`dashboard`**: no services needed -- it runs `tsc -b && vite build`
   and `vitest run` against mocked/component-level tests only.

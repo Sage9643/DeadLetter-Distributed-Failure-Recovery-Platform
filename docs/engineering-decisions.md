@@ -1334,3 +1334,64 @@ an actual VPS account and a real domain are required to provision and
 point at, and both can only come from the project owner. This decision
 record exists so the *reasoning* is captured even though the
 deployment itself is still pending that external input.
+
+## Decision: a small, hand-rolled migration runner, not a migration framework/ORM (Phase 17)
+
+**Context:** `infra/init-db/*.sql`, mounted at Postgres's own
+`docker-entrypoint-initdb.d`, only ever runs once, against an empty
+data volume. This project's own history already hit that gap twice
+(`docs/database.md`'s Phase 6 and Phase 10 entries) -- both times, a
+schema change had to be applied by hand against the live database
+because nothing else would have run it. A real fix was needed before a
+real deployment, where "someone remembers to run the new file by hand"
+is not an acceptable production story.
+
+**Options considered:**
+- *A full migration framework/ORM* (e.g. `node-pg-migrate`, Prisma
+  Migrate, Knex migrations). Rejected: this project has three small,
+  entirely additive SQL migrations and no ORM anywhere in its stack
+  (queries are hand-written SQL via `pg` throughout, a deliberate
+  earlier decision -- see the rest of this document). Adopting a
+  migration framework now would mean learning and configuring a tool
+  to solve a three-file problem, and would be exactly the kind of
+  "infrastructure for its own sake" this project's stated scope rules
+  out.
+- *Keep the manual `psql`-piping process, just document it better.*
+  Rejected: this is the status quo that already failed twice. Better
+  documentation does not fix "a human has to remember," and the master
+  finalization brief this phase continues explicitly calls out this
+  scenario as a production concern to actually fix, not just describe.
+- *A small, project-owned runner using the `pg` client apps/api
+  already depends on.* **Chosen.** `apps/api/src/scripts/migrate.ts`:
+  a `schema_migrations` ledger table, filename-ordered application,
+  one transaction per file, a Postgres advisory lock against
+  concurrent runs. No new dependency, no new concept beyond what
+  `apps/api` already uses everywhere else (`pg`, transactions).
+
+**Why a ledger table when every existing migration file is already
+`IF NOT EXISTS`-defensive (so re-running them is harmless anyway):**
+that defensiveness is a property of THESE three files, not a guarantee
+this script can rely on for every future one. A future migration might
+legitimately need to be non-idempotent (a data backfill, a column
+rename via `ALTER ... RENAME`, a one-time cleanup) -- the ledger is
+what makes tracking "has this already run" correct in general, rather
+than depending on every future migration's author remembering to write
+defensive SQL by convention.
+
+**Why forward-only, no down-migrations:** every migration this project
+has needed so far is purely additive (a new table, a new
+nullable/defaulted column), and a rollback story more elaborate than
+"restore the Postgres volume snapshot taken before deploying" has
+never actually been needed. Building down-migrations now would be
+solving a problem this project does not have -- see
+`docs/deployment.md`'s "Rollback considerations" for the honest
+statement of what this does and does not cover.
+
+**Why a separate Compose `migrate` service instead of running it
+inside the `api` container's own startup:** a dedicated one-shot
+service with `condition: service_completed_successfully` gives a clean
+signal Compose itself understands (`api`/`worker` physically cannot
+start before migrations succeed, not just "hopefully migrations ran
+first because of code ordering inside `index.ts`"), and its logs are
+separately inspectable (`docker compose logs migrate`) without being
+interleaved with the running API's own request logs.

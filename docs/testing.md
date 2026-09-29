@@ -150,6 +150,37 @@ reuses these exact commands rather than introducing a separate
 migration mechanism; this manual sequence remains the correct way to
 set up `deadletter_test` for local development.
 
+**Superseded in Phase 17:** the manual per-file `psql`-piping sequence
+above is the *original* bootstrap method and is kept here as historical
+record, but it is no longer how this project actually applies schema
+changes anywhere. `apps/api/src/scripts/migrate.ts` (a small,
+project-owned migration runner -- not a new framework/ORM dependency)
+replaced it everywhere: `.github/workflows/ci.yml` now runs it instead
+of piping the three `.sql` files by hand, and
+`infra/docker-compose.prod.yml` runs it as a `migrate` service before
+`api`/`worker` are allowed to start. The reason: the old
+`docker-entrypoint-initdb.d` auto-init mechanism (and, equivalently,
+"remember to run the new file by hand") only ever covers a *fresh*,
+empty database -- this project's own history has two real incidents of
+a schema change needing to be applied by hand against an
+already-populated volume (see docs/database.md, Phase 6 and Phase 10
+entries) because nothing else would have applied it. The current,
+correct way to create and populate `deadletter_test` locally is:
+
+```
+docker exec -it deadletter-postgres psql -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
+cd apps/api
+$env:DATABASE_URL="postgresql://deadletter:deadletter_dev_password@localhost:5432/deadletter_test"; $env:MIGRATIONS_DIR="../../infra/migrations"; npm run migrate
+```
+
+(PowerShell syntax for the two environment variables, matching this
+project's real Windows development environment; the equivalent in bash
+is `DATABASE_URL=... MIGRATIONS_DIR=... npm run migrate`.) This is
+idempotent -- safe to re-run any time a new migration file is added,
+against either a brand new or an already-populated `deadletter_test`.
+See docs/deployment.md for the full migration runner design and its
+production usage.
+
 ## Test database safety
 
 Two independent layers:
