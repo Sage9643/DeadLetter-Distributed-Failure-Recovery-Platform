@@ -353,10 +353,47 @@ explicit Phase 12 scope guard no change was made to connection.ts, the
 dispatcher, or any other protected component to investigate or resolve
 the disagreement.
 
-## Note on CI/CD (as of Phase 11)
+## CI/CD (Phase 13)
 
-`.github/workflows/` was scaffolded empty in Phase 0 and has never been
-populated. No automated CI currently runs the Jest suite or any future
-k6 load tests on push/PR. This is acknowledged explicitly here, not
-addressed as part of Phase 11 -- CI wiring remains a distinct, future
-decision.
+`.github/workflows/ci.yml` runs on every push and pull request targeting
+`main`. It is split into three independent jobs -- `api`, `worker`, and
+`dashboard` -- so each workspace's build/test result is visible on its
+own in the Actions UI rather than as one combined pass/fail.
+
+- **`api`** and **`worker`**: each provisions its own `postgres:16-alpine`
+  and `rabbitmq:3.13-management-alpine` GitHub Actions *service*
+  containers, using the exact same image tags and credentials as
+  `infra/docker-compose.yml` and the exact same healthchecks. Because
+  these jobs run directly on the runner VM (no `container:` key), the
+  service ports are reachable at `localhost`, which is exactly what
+  `apps/api/.env.test` and `apps/worker/.env.test` already expect --
+  no workflow-level environment overrides were needed. Each job runs
+  `npm ci` at the workspace root, builds its app (`tsc`), creates the
+  `deadletter_test` database and applies `infra/init-db/001`-`003` via
+  `psql` (mirroring the manual setup documented in testing.md exactly,
+  not a new migration mechanism), then runs `npm test -w apps/<app> --
+  --runInBand`.
+- **`dashboard`**: no services needed -- it runs `tsc -b && vite build`
+  and `vitest run` against mocked/component-level tests only.
+
+**Deliberately out of scope for CI, preserving the existing project
+direction rather than expanding it:** k6 load tests and the manual
+chaos/RabbitMQ-outage tests. `docs/load-testing.md` already documents
+these as run manually, against real Docker Compose infrastructure, not
+wired into any CI -- this phase does not change that. See
+engineering-decisions.md for the reasoning.
+
+**Verification status:** the individual commands in this workflow
+(`npm run build -w apps/api`, `-w apps/worker`; `npx tsc -b` for the
+dashboard) were run for real in this phase and passed (see
+development-log.md, Phase 13). The Jest suites could not be executed
+from this session's own environment for the same pre-existing bridge
+limitation documented in Phase 12's closure (not a defect in this
+workflow), and the dashboard's `vite build`/`vitest run` hit an
+unrelated, session-local `@rollup/rollup-linux-x64-gnu` optional-
+dependency gap (a well-known npm bug, not a project defect -- a fresh
+`npm ci` on a real Linux GitHub Actions runner installs the correct
+platform binary). The workflow file itself has not yet been exercised
+by an actual GitHub Actions run, since doing so requires a push, which
+this phase deliberately does not perform -- see development-log.md for
+the full, honest accounting of what was and was not verified.

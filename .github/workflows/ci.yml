@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  api:
+    name: API — build & test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: deadletter
+          POSTGRES_PASSWORD: deadletter_dev_password
+          POSTGRES_DB: deadletter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deadletter -d deadletter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: deadletter
+          RABBITMQ_DEFAULT_PASS: deadletter_dev_password
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies (workspace root)
+        run: npm ci
+
+      - name: Build apps/api
+        run: npm run build -w apps/api
+
+      - name: Set up deadletter_test database
+        env:
+          PGPASSWORD: deadletter_dev_password
+        run: |
+          psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/001_create_jobs_table.sql
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/002_phase6_replay_columns.sql
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/003_phase10_outbox_table.sql
+
+      - name: Test apps/api
+        run: npm test -w apps/api -- --runInBand
+
+  worker:
+    name: Worker — build & test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: deadletter
+          POSTGRES_PASSWORD: deadletter_dev_password
+          POSTGRES_DB: deadletter
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U deadletter -d deadletter"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+      rabbitmq:
+        image: rabbitmq:3.13-management-alpine
+        env:
+          RABBITMQ_DEFAULT_USER: deadletter
+          RABBITMQ_DEFAULT_PASS: deadletter_dev_password
+        ports:
+          - 5672:5672
+          - 15672:15672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies (workspace root)
+        run: npm ci
+
+      - name: Build apps/worker
+        run: npm run build -w apps/worker
+
+      - name: Set up deadletter_test database
+        env:
+          PGPASSWORD: deadletter_dev_password
+        run: |
+          psql -h localhost -U deadletter -d deadletter -c "CREATE DATABASE deadletter_test;"
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/001_create_jobs_table.sql
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/002_phase6_replay_columns.sql
+          psql -h localhost -U deadletter -d deadletter_test -f infra/init-db/003_phase10_outbox_table.sql
+
+      - name: Test apps/worker
+        run: npm test -w apps/worker -- --runInBand
+
+  dashboard:
+    name: Dashboard — build & test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies (workspace root)
+        run: npm ci
+
+      - name: Build apps/dashboard
+        run: npm run build -w apps/dashboard
+
+      - name: Test apps/dashboard
+        run: npm test -w apps/dashboard

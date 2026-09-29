@@ -887,3 +887,90 @@ Incident 5). A precise-looking but fabricated estimate was judged worse
 than an honest fixed value. 5 seconds is a reasonable client-retry
 cadence, not a measured drain-time constant -- this is a locked design
 default, not empirically derived.
+## Decision: CI (Phase 13) runs build + Jest/Vitest only -- not k6, not chaos tests
+
+**Context:** `.github/workflows/ci.yml` is the project's first CI
+pipeline. `docs/load-testing.md` already documents k6 load scenarios
+and manual RabbitMQ-outage chaos tests, both run by hand against real
+Docker Compose infrastructure (see architecture.md's now-updated CI/CD
+note).
+
+**Chosen approach:** CI runs `tsc` builds and the Jest suites (`api`,
+`worker`) and Vitest suite (`dashboard`) on every push/PR to `main`,
+using GitHub Actions service containers for PostgreSQL/RabbitMQ. It
+does **not** run any k6 scenario and does **not** run the manual
+RabbitMQ-stop/start chaos test.
+
+**Why:** k6 scenarios in this project run for a fixed wall-clock
+duration (10-20s) at real load and their pass/fail signal is a
+statistical shape (status-code distribution, latency percentiles), not
+a simple assertion -- running them on every push would slow CI
+substantially and their results are not the kind of thing a CI gate
+should silently red/green on without a human reading the numbers. The
+chaos test requires deliberately stopping the RabbitMQ service
+mid-run, which GitHub Actions' service-container model does not
+support cleanly (services are managed by the runner, not by the job's
+own steps) and which would risk flaking unrelated jobs sharing the
+same runner pool. This mirrors, rather than reverses, the project's
+existing documented direction (`docs/load-testing.md`: "Not
+containerized, not wired into any CI"). Load and chaos testing remain
+real, manual, evidence-collecting exercises against real Docker
+Compose infrastructure, run and reported the same way Phase 11 and
+Phase 12 already did.
+
+## Decision: CI database setup mirrors the documented manual `deadletter_test` setup exactly
+
+**Context:** `deadletter_test` (used by both apps' `.env.test`) is
+normally created by hand (`docs/testing.md`): `CREATE DATABASE
+deadletter_test`, then piping each `infra/init-db/*.sql` file through
+`psql` in order. There is no migration runner or ORM in this project.
+
+**Chosen approach:** the CI workflow reproduces the exact same three
+manual commands (`CREATE DATABASE`, then `001`, `002`, `003` in order)
+against the `postgres` service container via `psql`, instead of
+introducing a migration tool or baking a pre-migrated image.
+
+**Why:** introducing a migration framework solely to make CI easier
+would be new infrastructure not required by any current project
+need (`.sql` files are hand-run everywhere else in this project, by
+design -- see database.md), and it would make local dev and CI diverge
+in how the schema gets built. Reusing the exact documented commands
+keeps CI a faithful re-execution of the same real process a developer
+already runs by hand, rather than a second, parallel source of truth
+for schema setup.
+
+## Decision: CI split into three independent jobs (api / worker / dashboard), not one combined job
+
+**Context:** the monorepo has three real workspaces with different
+runtime needs -- `api` and `worker` need PostgreSQL + RabbitMQ service
+containers, `dashboard` needs neither.
+
+**Chosen approach:** three separate GitHub Actions jobs, each with
+its own checkout/install/build/test steps, running in parallel.
+
+**Why:** a single combined job would pay for Postgres/RabbitMQ service
+containers even while building/testing the dashboard, and a failure in
+one workspace would obscure whether the other two workspaces were
+still healthy. Three jobs give an independent pass/fail signal per
+workspace in the Actions UI at the cost of some duplicated `npm ci`
+time across jobs -- judged a reasonable, standard tradeoff for a
+three-workspace monorepo of this size, not overengineering (no matrix
+build, no reusable/composite actions, no custom Docker images were
+introduced).
+
+## Decision: Node.js 22 pinned in CI, matching the version this phase was actually built against
+
+**Context:** no `engines` field or `.nvmrc` exists anywhere in this
+repository to pin a Node version.
+
+**Chosen approach:** `actions/setup-node@v4` with `node-version: "22"`.
+
+**Why:** this is the Node major version (`v22.23.2`) actually used to
+run `npx tsc` for `apps/api` and `apps/worker` and both `tsc -b` for
+`apps/dashboard` during this phase's own verification (see
+development-log.md, Phase 13) -- pinning to the version already proven
+to build this repository, rather than guessing at `latest` or an
+arbitrary LTS number. If the project's real development machine is on
+a different Node major version, that should be reconciled explicitly
+(an `.nvmrc` would be a reasonable follow-up), not silently assumed
+here.

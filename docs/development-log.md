@@ -1723,3 +1723,92 @@ bridge, confirmed via direct investigation, not assumed) and could not
 reproduce the run itself -- this is a limitation of this Claude
 session's execution environment only, not of the project or of Phase
 12, and does not affect the authoritative test-pass evidence above.
+
+## Phase 13 -- CI/CD Pipeline (GitHub Actions)
+
+**Goal:** wire automated CI so the Jest/Vitest suites and TypeScript
+builds run on every push/PR, closing the gap explicitly flagged in
+Phase 11 (architecture.md's former "Note on CI/CD" section) and in
+the original project priorities list. No application code changes are
+in scope for this phase -- it is infrastructure/tooling only.
+
+**Why this phase, not something else:** determined by reading
+README.md (stale, still said "Phase 0"), architecture.md (explicitly
+flagged CI wiring as deferred, "a distinct, future decision"),
+load-testing.md ("Not containerized, not wired into any CI"), and
+confirming `.github/workflows/` was genuinely empty (`find .github
+-type f` returned nothing). This is documented pending work, not an
+invented feature.
+
+**Implementation:** `.github/workflows/ci.yml`, three parallel jobs
+(`api`, `worker`, `dashboard`) -- see architecture.md's updated CI/CD
+section for the full design and engineering-decisions.md for the
+reasoning behind each choice (scope, DB setup method, job split, Node
+version). `README.md` got a CI badge and a corrected status line
+(previously still said "Phase 0"); no other application files were
+touched.
+
+**Real verification performed from this session's own environment
+(device-bridge shell, not GitHub Actions itself -- see limitation
+note below):**
+
+- `cd apps/api && npx tsc` -- **PASS** (real build, `dist/` produced;
+  cleaned up automatically since `dist/` is gitignored).
+- `cd apps/worker && npx tsc` -- **PASS** (real build).
+- `cd apps/dashboard && npx tsc -b` -- **PASS** (real typecheck/build
+  references).
+- `cd apps/dashboard && npx vite build` -- **FAILED**: `Cannot find
+  module @rollup/rollup-linux-x64-gnu`. This is a well-known npm
+  optional-dependency bug (npm/cli#4828): this session's `node_modules`
+  was installed on the real Windows machine and is reached here only
+  through the read-only device-bridge FUSE mount, so the Linux-only
+  native Rollup binary was never installed for this platform. This is
+  not a Phase 13 defect and not a dashboard defect -- a fresh `npm ci`
+  on an actual Linux GitHub Actions runner (or on any real Linux
+  machine) installs the correct platform-specific optional dependency
+  automatically.
+- `cd apps/dashboard && npx vitest run` -- **FAILED**, same root cause
+  as above (Vitest also depends on Rollup via Vite).
+- `cd apps/api && npx jest --listTests` -- **FAILED**: `Preset ts-jest
+  not found relative to rootDir`. This is the exact same device-bridge
+  `node_modules` hoisting/symlink-resolution gap already documented in
+  Phase 12's closure (development-log.md, above) -- not new, not a
+  Phase 13 defect. `apps/worker`'s Jest config is identical, so the
+  same limitation applies there without needing to re-demonstrate it.
+- `git status --short` after all of the above -- clean (no stray
+  build artifacts; `dist/`, `*.tsbuildinfo` are gitignored).
+- `.github/workflows/ci.yml` was parsed with Python's `yaml.safe_load`
+  and confirmed structurally valid (three jobs, correct step order per
+  job). `actionlint` was not available in this session and could not
+  be installed (no network egress from this device-bridge shell), so
+  this is syntax/structure validation only, not GitHub's own schema
+  validation.
+
+**Genuine, honestly-flagged limitation of this phase's verification:**
+this session's device-bridge shell has no `docker` binary and no
+network egress beyond loopback (confirmed: `docker: command not
+found`; `github.com` fails DNS resolution), so **no actual GitHub
+Actions run of this workflow has been observed by this session.** The
+workflow's individual commands (build commands, the `psql` migration
+sequence, the `npm test -w <app> -- --runInBand` invocations) were each
+cross-checked against real files in this repository (real
+`docker-compose.yml` image tags/credentials, real `.env.test` contents,
+real `infra/init-db/*.sql` contents, real `package.json` scripts in
+each workspace) and, where directly executable from this environment,
+actually run -- but the workflow as a whole has only been reviewed, not
+executed end-to-end. Per this phase's explicit instructions, this
+change is not pushed, so an actual Actions run has not yet happened.
+The first real, authoritative CI run will be the one GitHub itself
+executes once this is pushed -- that result should be treated the same
+way Phase 12's real Windows test results were: as the authoritative
+evidence, superseding this session's partial, environment-limited
+verification.
+
+**Regression check:** no application code (`apps/api/src`,
+`apps/worker/src`, `apps/dashboard/src`) was modified in this phase --
+confirmed via `git diff --stat` showing changes confined to
+`.github/workflows/ci.yml` (new), `README.md`, and the docs listed
+above. Phase 10 (outbox), Phase 11 (load-test guarantees), and Phase 12
+(rate limiting/backpressure) behavior is therefore unaffected by
+construction, not merely by assertion -- there is no code diff for any
+of those components to regress.

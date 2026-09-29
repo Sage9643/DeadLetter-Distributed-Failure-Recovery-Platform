@@ -74,6 +74,15 @@ Applied and verified via `\d jobs` against deadletter_test: all 13
 columns present, matching the dev database schema exactly. The dev
 `deadletter` database itself was never altered by this process.
 
+**Note added in Phase 13:** this same three-command sequence (plus the
+Phase 10 `003_phase10_outbox_table.sql` migration, added after this
+section was originally written) is now also run automatically, against
+a fresh PostgreSQL service container, by `.github/workflows/ci.yml` on
+every push/PR -- see architecture.md's CI/CD section. That workflow
+reuses these exact commands rather than introducing a separate
+migration mechanism; this manual sequence remains the correct way to
+set up `deadletter_test` for local development.
+
 ## Test database safety
 
 Two independent layers:
