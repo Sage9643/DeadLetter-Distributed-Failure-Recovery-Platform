@@ -376,3 +376,44 @@ correctly written by markOutboxFailed on every failure, which is what
 enables recovery. It DOES mean per-tick failure visibility in logs is
 currently reduced compared to the original design. Flagged as a real,
 minor, accepted gap for a future small fix, not silently hidden.
+## PostgreSQL connection resilience signals (Phase 15)
+
+Both `apps/api/src/db/pool.ts` and `apps/worker/src/db/pool.ts` now log
+a structured `logger.error({ err }, "PostgreSQL pool error (idle
+client); pool remains available, no process restart")` line whenever
+the pool's background `"error"` event fires -- previously, this event
+caused an immediate `process.exit(1)` with no equivalent visibility
+into what happened, since the process disappeared along with it. An
+operator watching logs can now see this event happen without losing
+the process itself.
+
+On the worker side, `consumer.ts` additionally logs `"Worker requeueing
+after DB/infrastructure error; backing off before next delivery"`
+(with the current `dbErrorCount` and computed `delayMs`) each time a DB
+error triggers the new backoff-before-NACK path -- an operator can see
+a sustained outage's redelivery rate throttling itself in real time,
+the same way Phase 14's `"Worker RabbitMQ consumer resubscribed after
+disconnect"` line made RabbitMQ recovery visible.
+
+None of this is wired into `GET /api/stats`, `/ready`, or any other
+structured metric yet -- it is log-level visibility only, consistent
+with this project's established treatment of similar signals (see
+Phase 8 and Phase 14's decisions in `engineering-decisions.md`).
+`/ready`'s existing `pool.query("SELECT 1")` check is unchanged, but is
+now meaningfully more useful than before: previously, a pool error
+could make the whole process (and therefore `/ready` itself) disappear
+before it ever had a chance to report anything; now the process stays
+up to report `postgres: "error"` for as long as the outage actually
+lasts.
+
+**Confirmed by a real run:** during Phase 15's real PostgreSQL chaos
+test (see `docs/incidents-and-failures.md`, Incident 9, and
+`docs/development-log.md`, Phase 15), the worker's backoff log line
+was observed progressing through the designed `1s -> 2s -> 4s -> 8s ->
+16s -> 30s` sequence and then holding at the 30s cap for the remainder
+of the outage, against a worker process (PID 5444) that was never
+restarted. Post-recovery, `/ready` reported `postgres: "ok"` and
+`rabbitmq: "ok"`, and a legitimate queued job completed successfully
+(`attempt_count = 1`). This section's description of what the code
+emits is no longer purely theoretical -- it has been directly
+witnessed in a real chaos test.

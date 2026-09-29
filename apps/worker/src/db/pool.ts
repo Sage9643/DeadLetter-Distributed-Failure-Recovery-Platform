@@ -6,7 +6,28 @@ export const pool = new Pool({
   connectionString: env.DATABASE_URL,
 });
 
+// Phase 15: a pool-level "error" event fires for an already-connected,
+// currently-IDLE client that hits a background/network-level failure
+// (e.g. Postgres restarting, a network blip) -- it does NOT mean every
+// connection is down and it is not the same thing as a query rejecting
+// in the foreground (those are already handled at each call site: see
+// consumer.ts's own DB-error catch blocks, which now back off before
+// requeueing -- see the Phase 15 addition there). node-postgres's Pool
+// already discards the errored client internally and will lazily
+// create a fresh connection the next time one is needed -- nothing
+// needs to be torn down for the pool to keep working. Previously this
+// handler called process.exit(1), which killed the entire worker
+// process on any such event; in this project's real deployment
+// (infra/docker-compose.yml only runs postgres/rabbitmq -- API and
+// worker run unsupervised via `npm run dev`, no restart policy), that
+// meant a transient Postgres blip took the whole worker down with
+// nothing to bring it back. This log line replaces that crash -- see
+// docs/incidents-and-failures.md and docs/engineering-decisions.md,
+// Phase 15, for the full rationale and the deliberate scope boundary
+// (this only changes the pool's background error handling; it does
+// NOT touch the worker's separate, intentional initial-boot
+// RabbitMQ-connect-failure exit in index.ts, which is a different
+// dependency and a different, unrelated decision -- see Phase 14).
 pool.on("error", (err) => {
-  logger.error({ err }, "Unexpected PostgreSQL pool error");
-  process.exit(1);
+  logger.error({ err }, "PostgreSQL pool error (idle client); pool remains available, no process restart");
 });

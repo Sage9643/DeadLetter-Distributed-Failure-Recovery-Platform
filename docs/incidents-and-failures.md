@@ -751,3 +751,120 @@ closing the "apps/api's real Jest results" gap noted earlier in this
 validation round. **Still not claimed:** specific recovery
 timing/duration or raw structured log-line evidence, since neither was
 captured or reported.
+## Incident 9 -- PostgreSQL pool errors crashed the entire process (discovered during Phase 15 scoping, not previously documented)
+
+**Discovered:** during Phase 15's project-state review (source-code
+inspection of `apps/api/src/db/pool.ts` and `apps/worker/src/db/pool.ts`,
+not prompted by a prior incident or a reported production failure).
+`grep -rn "pool.on\|process.exit(1)" docs/*.md` across every doc in
+this project returned nothing relevant before this entry -- this gap
+had no prior documentation anywhere.
+
+**The defect:** both files attached `pool.on("error", (err) => { ...;
+process.exit(1); })`. `pg.Pool` emits `"error"` for an already-
+connected, currently-IDLE client hitting a background/network-level
+failure (e.g. Postgres restarting, a brief network blip) -- this does
+NOT mean the whole pool is unusable; `pg.Pool` already discards that
+one client internally and lazily creates a fresh connection the next
+time a query needs one. Calling `process.exit(1)` here killed the
+entire API or worker process on an event that did not actually require
+it.
+
+**Why this matters more than an ordinary "known limitation":** neither
+the API nor the worker is containerized or process-supervised in this
+project's real deployment -- `infra/docker-compose.yml` only defines
+`postgres` and `rabbitmq` (both `restart: unless-stopped`); the API and
+worker run via `npm run dev` on the host with nothing to restart them.
+A single transient Postgres blip -- exactly the kind of event every
+prior chaos test in this project has deliberately induced against
+RabbitMQ -- would have silently taken down the whole API or worker
+process, with no automatic recovery path at all, and no operator
+notification beyond the process simply disappearing.
+
+**Relationship to the existing, separately-tracked hot-loop
+limitation:** `failure-handling.md` and `engineering-decisions.md`
+already flagged (since Phase 4) that the worker's DB-error
+NACK+requeue paths have no backoff and could hot-loop under a
+sustained outage. That is a related but distinct problem: a *query*
+rejecting in the foreground (e.g. `claimJob()` failing) does not
+necessarily emit the *pool's* background `"error"` event. Both gaps
+share the same root cause -- no resilience story for the Postgres
+dependency -- and are fixed together in Phase 15.
+
+**Fix:** see `docs/architecture.md`'s "PostgreSQL connection resilience
+& worker DB-error backoff (Phase 15)" section and
+`docs/engineering-decisions.md` for the full design. In short: the pool
+`"error"` handler now only logs, never exits; the worker's two DB-error
+NACK paths now sleep for a capped exponential backoff (1s base,
+doubling, 30s cap, a consecutive-error counter reset after any
+successful `claimJob()` call) before requeueing.
+
+**Validation status (updated with real chaos evidence):** this fix
+has been verified by (a) a real TypeScript build of both `apps/api`
+and `apps/worker`, (b) three new unit tests
+(`apps/api/src/__tests__/unit/poolErrorHandling.test.ts`,
+`apps/worker/src/__tests__/unit/poolErrorHandling.test.ts`,
+`apps/worker/src/__tests__/unit/dbErrorBackoff.test.ts`) that mock the
+`pg` module (and, for the backoff test, `jobService`/`jobProcessor`/
+`retryPublisher`) to deterministically simulate a pool error and a
+sequence of DB failures, and (c) a real, sustained PostgreSQL outage
+against the actual Docker Compose stack, reported by the user with the
+following evidence:
+
+- `docker compose stop postgres` was run against a running worker
+  (PID 5444) and API.
+- The worker was **not restarted** during the outage -- the same
+  process (PID 5444) stayed up the entire time, confirming the pool
+  `"error"` handler's log-only behavior in place of the old
+  `process.exit(1)`.
+- A legitimate, application-created `QUEUED` job
+  (`4b12f5f2-124f-452a-8593-8962d75b85a3`) was present during the
+  outage.
+- The worker's DB-error backoff was observed in its logs progressing
+  `1s -> 2s -> 4s -> 8s -> 16s -> 30s`, then remaining capped at 30s
+  for the remainder of the outage -- matching
+  `computeDbErrorBackoffMs()`'s designed base/doubling/30s-cap shape
+  exactly.
+- PostgreSQL was restored **without restarting the worker**. The same
+  worker process then successfully claimed the pending job and
+  completed it: final state `COMPLETED`, `attempt_count = 1` (i.e. no
+  spurious extra attempts were burned by the outage or the backoff
+  logic).
+- Post-recovery `/ready` reported `postgres: "ok"` and
+  `rabbitmq: "ok"`.
+- Post-recovery RabbitMQ queue state: `deadletter.jobs.queue` 0
+  ready/0 unacked, `deadletter.jobs.retry.queue` 0 ready/0 unacked,
+  `deadletter.jobs.dlq` 36 ready/0 unacked (the DLQ count reflects
+  prior, unrelated accumulated entries from earlier phases' testing --
+  this job completed successfully and was never dead-lettered).
+
+This is real, first-hand evidence that both halves of the Phase 15 fix
+work as designed under an actual sustained PostgreSQL outage: the pool
+no longer crashes the process, and the worker's backoff genuinely
+throttles redelivery instead of hot-looping, with a full recovery to a
+successfully completed job once the dependency returned.
+
+**Real Jest execution (confirmed after this incident was first
+documented):** run from the user's own real environment --
+API: 19/19 suites passed, 84/84 tests passed; Worker: 6/6 suites
+passed, 23/23 tests passed; combined 25/25 suites, 107/107 tests
+passed, including the three new unit tests this incident's fix added.
+This session's own device-bridge shell still cannot run Jest itself
+(`Preset ts-jest not found relative to rootDir`, reconfirmed again
+during this closeout) -- the real result above came from the user's
+environment, not this session, and is reported here exactly as given,
+with nothing added or adjusted. A related fix surfaced by getting Jest
+running for real: both apps' `jest.setup.js` now load `.env.test` with
+dotenv's `override: true`, so a stale shell-exported `DATABASE_URL`
+(the same class of issue diagnosed earlier in this phase's chaos
+testing) cannot silently shadow the test database during a Jest run.
+
+**Engineering lesson:** a defensive-looking error handler
+(`process.exit(1)` "to fail fast and loud") can itself be the
+reliability defect, especially once a process has no supervisor to
+restart it. The same "react to the signal, let the existing mechanism
+self-heal" principle Phase 14 proved for RabbitMQ connection recovery
+applies just as directly to the Postgres pool -- this was found by
+deliberately re-reading the DB layer with that principle in mind while
+scoping the next phase, not by a reported failure or a prior code
+review flagging it.

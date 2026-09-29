@@ -2021,3 +2021,198 @@ exactly the same 3 modified implementation files
 (`apps/api/src/queue/connection.ts`, `apps/worker/src/queue/connection.ts`,
 `apps/worker/src/consumer.ts`) and 3 new test files as before, nothing
 else. No production behavior changed as a result of this fix.
+
+## Phase 15 -- PostgreSQL Connection Resilience & Worker DB-Error Backoff
+
+**Goal:** close two gaps in how both apps handle their PostgreSQL
+dependency: (1) a newly-discovered, previously undocumented defect
+where any pool-level `"error"` event crashed the entire process
+(`process.exit(1)`), and (2) a previously self-identified, still-open
+gap tracked since Phase 4 -- the worker's DB-error NACK+requeue paths
+have no backoff and could hot-loop under a sustained outage.
+
+**Why this phase:** determined via a full project-state review
+requested and approved separately (Phase 15 proposal), which inspected
+source code (not just docs) across both apps' DB layer, the worker's
+consumer, the outbox dispatcher, docker-compose.yml, and every
+`docs/*.md` file for TODOs, deferred items, and known limitations.
+`apps/api/src/db/pool.ts` and `apps/worker/src/db/pool.ts`'s
+`process.exit(1)` on any pool error was a new finding (confirmed via
+`grep -rn "pool.on\|process.exit(1)" docs/*.md` returning nothing
+relevant) -- more severe than the already-tracked hot-loop limitation,
+since neither app is process-supervised in this project's real
+deployment (only `postgres`/`rabbitmq` are containerized with
+`restart: unless-stopped`; API/worker run via `npm run dev`). Both
+gaps share one root cause (no resilience story for the Postgres
+dependency) and one fix theme (react to the failure signal instead of
+crashing/spinning, mirroring Phase 14's proven pattern for RabbitMQ),
+so they were addressed together rather than as two separate phases.
+
+**Implementation:**
+- `apps/api/src/db/pool.ts` -- `pool.on("error")` now only logs (via
+  the app's existing pino `logger`, replacing a prior raw
+  `console.error`); no `process.exit()` call remains.
+- `apps/worker/src/db/pool.ts` -- identical pattern (already used the
+  structured logger; only the `process.exit(1)` call was removed).
+- `apps/worker/src/consumer.ts` -- added `computeDbErrorBackoffMs()`
+  (a pure, exported function: 1s base, doubling, capped at 30s) and
+  `backoffBeforeRequeue()` (increments a module-level consecutive-
+  error counter, logs, sleeps), called immediately before both
+  existing `channel.nack(msg, false, true)` calls. The counter is
+  reset to 0 immediately after any `claimJob()` call that does not
+  throw.
+
+See `docs/architecture.md`'s new "PostgreSQL connection resilience &
+worker DB-error backoff (Phase 15)" section for the full design and
+`docs/engineering-decisions.md` for the reasoning behind each specific
+choice, including why the outbox dispatcher, Phase 14's RabbitMQ
+recovery logic, the worker's initial-boot exit behavior, and every
+existing foreground query-error handler were deliberately left
+untouched.
+
+**Real verification performed from this session's own environment
+(device-bridge shell -- the same one used for every prior phase):**
+
+- `cd apps/api && npx tsc --noEmit` -- **PASS**.
+- `cd apps/worker && npx tsc --noEmit` -- **PASS**.
+- A full project-wide type check (same temporary, unstaged
+  `_tmp_fullcheck.tsconfig.json` technique used in Phase 14, deleted
+  immediately after) for `apps/api`: the same 5 pre-existing type
+  errors in `rateLimiter.test.ts` (Phase 12 file, untouched by Phase
+  15, unrelated to any file this phase changed) -- confirmed still
+  present, still unrelated, not fixed, per explicit instruction.
+- Three new unit tests written and each individually type-checked
+  clean via the standalone `tsc --ignoreConfig` technique:
+  `apps/api/src/__tests__/unit/poolErrorHandling.test.ts`,
+  `apps/worker/src/__tests__/unit/poolErrorHandling.test.ts`,
+  `apps/worker/src/__tests__/unit/dbErrorBackoff.test.ts`. **These
+  tests were NOT executed under a real Jest run** -- this session's
+  device-bridge shell has the identical `ts-jest`/`node_modules`-
+  hoisting limitation documented in every prior phase's closure
+  (`Preset ts-jest not found relative to rootDir`), reconfirmed again
+  this phase. Whether they actually pass under real Jest is genuinely
+  unverified by this session.
+- `git status --short`/`git diff --stat` after all builds/type-checks
+  confirmed exactly the intended scope: `apps/api/src/db/pool.ts`,
+  `apps/worker/src/db/pool.ts`, `apps/worker/src/consumer.ts` modified;
+  the 3 new test files added; nothing else.
+
+**Genuine, honestly-flagged limitation of this phase's verification:**
+this session's device-bridge shell has no `docker` binary and cannot
+run real Jest, so the authoritative evidence this phase needs -- a
+real, sustained Postgres outage against the actual Docker Compose
+stack, with neither the API nor the worker process restarted -- has
+**not** been performed. Per explicit instruction, the previously
+documented "NACK+requeue hot-loop" limitation is marked resolved only
+after that real chaos test (and real Jest execution) actually pass,
+not before. Until then, this phase's fix should be treated as
+"implemented and unit-tested against mocked failure scenarios," not
+"proven to resolve either gap in production."
+
+**Regression check:** `git diff --stat` confines this phase's code
+changes to exactly 3 modified files (`apps/api/src/db/pool.ts`,
+`apps/worker/src/db/pool.ts`, `apps/worker/src/consumer.ts`) plus 3 new
+test files -- no other application file was touched. Phase 14's
+`queue/connection.ts` files (both apps) are unmodified. The public
+behavior of every existing foreground DB-error path (outbox
+dispatcher, `routes/health.ts`, the worker's other try/catch blocks)
+is unchanged -- the only new behavior is a sleep inserted immediately
+before two NACK calls that already existed, and a log-only pool-error
+handler that no longer exits. No existing test (Phase 5-14) exercises
+a pool-level `"error"` event or a sustained sequence of DB-query
+failures, so none of them can regress from this change by
+construction -- this reasoning has not been confirmed by an actual
+test run, for the same reason noted above.
+
+
+### Phase 15 addendum -- real PostgreSQL chaos test evidence
+
+After the implementation above was completed and documented, the user
+ran the actual chaos test against their real Windows/Docker Compose
+environment and reported the following real, first-hand evidence
+(reproduced here exactly as given, with no numbers invented or
+adjusted):
+
+- Worker PID: 5444.
+- The worker was **not restarted** during the PostgreSQL outage.
+- A legitimate, application-created `QUEUED` job
+  (`4b12f5f2-124f-452a-8593-8962d75b85a3`) was present during the
+  outage.
+- Observed worker DB-error backoff progression:
+  `1s -> 2s -> 4s -> 8s -> 16s -> 30s`.
+- Backoff remained capped at 30s for the remainder of the continued
+  outage.
+- PostgreSQL was restored without restarting the worker.
+- The same worker subsequently claimed the job successfully.
+- The job completed successfully with `attempt_count = 1`.
+- Final DB state: `COMPLETED`, `attempt_count = 1`.
+- Post-recovery `/ready`: `postgres: "ok"`, `rabbitmq: "ok"`.
+- Post-recovery RabbitMQ state: `deadletter.jobs.queue` 0 ready/0
+  unacked; `deadletter.jobs.retry.queue` 0 ready/0 unacked;
+  `deadletter.jobs.dlq` 36 ready/0 unacked (pre-existing accumulated
+  DLQ entries from earlier phases' testing, unrelated to this job,
+  which completed and was never dead-lettered).
+
+**What this confirms:** both halves of the Phase 15 fix work under a
+real, sustained PostgreSQL outage, not just under mocked unit tests --
+the pool `"error"` handler no longer crashes the process (the worker's
+PID never changed), and the worker's backoff genuinely throttles
+DB-error redelivery in the shape `computeDbErrorBackoffMs()` was
+designed to produce, with a clean recovery to a successfully completed
+job and no spurious extra attempts (`attempt_count = 1`, not higher).
+
+**What this did not confirm (at the time):** this evidence said
+nothing about whether the three new unit tests
+(`poolErrorHandling.test.ts` x2, `dbErrorBackoff.test.ts`) pass under a
+real Jest run. That gap was called out explicitly rather than folded
+into "Phase 15 is validated," per this project's standing rule against
+claiming test success without real, actual execution output.
+
+### Phase 15 addendum 2 -- real Jest execution
+
+Shortly after the chaos-test evidence above, the user ran the actual
+Jest suites on their own real environment and reported:
+
+- API: 19/19 suites passed, 84/84 tests passed.
+- Worker: 6/6 suites passed, 23/23 tests passed.
+- Combined: 25/25 suites, 107/107 tests passed -- including all three
+  of this phase's new unit tests.
+- A related fix, made to get there: both `apps/api/jest.setup.js` and
+  `apps/worker/jest.setup.js` now load `.env.test` with dotenv's
+  `override: true` (previously bare `dotenv.config(...)`, which does
+  not override an already-set environment variable). This closes the
+  same class of stale-`DATABASE_URL`-shadowing risk diagnosed earlier
+  in this phase's chaos-test troubleshooting, but for the Jest
+  environment specifically -- without it, a leftover shell-exported
+  `DATABASE_URL` could silently point a Jest run at the wrong database
+  even with a correct `.env.test` present.
+
+With this, Phase 15 has both halves of real evidence it was missing:
+real Jest execution (all new and existing tests passing) and a real,
+sustained PostgreSQL chaos test (the worker surviving the outage and
+recovering cleanly). Neither piece is fabricated or estimated -- both
+are reproduced here exactly as reported.
+
+**Documentation reconciled against this evidence:** `README.md`,
+`docs/architecture.md`, `docs/testing.md`, `docs/failure-handling.md`,
+and `docs/incidents-and-failures.md` (Incident 9) were updated to
+replace their "Jest not yet run" language with these real counts.
+`docs/observability.md` was left as previously updated (it only
+describes chaos-test-observed log behavior, not Jest).
+
+**Closeout verification performed from this session (device-bridge
+shell) as part of reconciling this evidence:**
+
+- `cd apps/api && npx tsc --noEmit` -- **PASS** (clean exit, no
+  errors).
+- `cd apps/worker && npx tsc --noEmit` -- **PASS** (clean exit, no
+  errors).
+- `git status --short` / `git diff --stat` confirmed the change set
+  matches exactly the intended Phase 15 scope: the 3 application
+  source files, the 2 `jest.setup.js` override fixes (made on the
+  user's own environment, not by this session), 10 modified doc files
+  plus README, and 3 new test files -- nothing unintended staged.
+- This session's own device-bridge shell still cannot run Jest itself
+  (`Preset ts-jest not found relative to rootDir`, reconfirmed again
+  during this closeout) -- the real 25/25 suite, 107/107 test result
+  above came from the user's own environment, exactly as reported.

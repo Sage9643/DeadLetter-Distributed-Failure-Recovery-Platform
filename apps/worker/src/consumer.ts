@@ -30,6 +30,44 @@ function isInvalidTextRepresentationError(err: unknown): boolean {
   return typeof err === "object" && err !== null && "code" in err && (err as { code?: string }).code === "22P02";
 }
 
+const DB_ERROR_BASE_DELAY_MS = 1000;
+const DB_ERROR_MAX_DELAY_MS = 30000;
+
+let dbErrorCount = 0;
+
+// Phase 15: resolves the "NACK+requeue on DB/publish errors has no
+// backoff -- could hot-loop under a sustained outage" limitation
+// tracked since Phase 4 (see failure-handling.md and
+// engineering-decisions.md, Phase 15). Pure function, exported for
+// direct unit testing: computes the delay for the Nth CONSECUTIVE
+// DB/infrastructure error (1-indexed -- the 1st error uses the base
+// delay, doubling thereafter, capped).
+export function computeDbErrorBackoffMs(consecutiveErrors: number): number {
+  return Math.min(DB_ERROR_BASE_DELAY_MS * 2 ** (consecutiveErrors - 1), DB_ERROR_MAX_DELAY_MS);
+}
+
+// Sleeps for the current consecutive-DB-error backoff BEFORE the
+// caller NACKs-and-requeues, so a sustained Postgres/infrastructure
+// outage throttles this worker's redelivery rate instead of retrying
+// as fast as RabbitMQ and the network allow. Deliberately local,
+// in-process state only -- no DB write records dbErrorCount (the DB
+// may be the thing that is down), and deliberately kept separate from
+// retryPolicy.ts's job-level retry backoff (a different concern:
+// infrastructure liveness, not job-processing retry tuning -- the same
+// separation Phase 14 used for resubscribeWithBackoff vs.
+// calculateBackoffMs). Reset to 0 by the caller after any claimJob()
+// call that does not throw, so an isolated blip does not inflate the
+// delay applied to later, unrelated messages.
+async function backoffBeforeRequeue(): Promise<void> {
+  dbErrorCount += 1;
+  const delayMs = computeDbErrorBackoffMs(dbErrorCount);
+  logger.warn(
+    { dbErrorCount, delayMs },
+    "Worker requeueing after DB/infrastructure error; backing off before next delivery"
+  );
+  await sleep(delayMs);
+}
+
 // Phase 14: attaches prefetch + the message handler to whatever
 // channel getChannel() currently returns. Called once at startup and
 // again, automatically, every time the cached channel is invalidated
@@ -95,6 +133,7 @@ async function subscribe(): Promise<void> {
       try {
         log.info("Attempting atomic claim");
         job = await claimJob(jobId);
+        dbErrorCount = 0; // Phase 15: claimJob() did not throw -- reset the backoff counter
 
         if (!job) {
           // Claim failed: not in a claimable state at the moment of the
@@ -127,6 +166,7 @@ async function subscribe(): Promise<void> {
         // Genuine infrastructure failure (e.g. DB unreachable) -- nothing
         // was recorded, safe to requeue.
         log.error({ err: dbErr }, "Database error while claiming job; requeueing");
+        await backoffBeforeRequeue(); // Phase 15
         channel.nack(msg, false, true);
         return;
       }
@@ -168,6 +208,7 @@ async function subscribe(): Promise<void> {
           }
         } catch (dbOrPublishErr) {
           log.error({ err: dbOrPublishErr }, "Failed to record retry/dead-letter outcome; requeueing original message");
+          await backoffBeforeRequeue(); // Phase 15
           channel.nack(msg, false, true);
           return;
         }

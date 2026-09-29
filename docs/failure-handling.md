@@ -75,8 +75,19 @@ terminal (a RETRYING job redelivered via TTL expiry must be reprocessed).
   `deadletter.jobs.dlq` with no automated or manual review path (Phase 6)
 - No replay mechanism (Phase 6)
 - Terminal-state guard is not a distributed lock (Phase 5)
-- NACK+requeue on DB/publish errors has no backoff — could hot-loop under
-  a sustained outage
+- ~~NACK+requeue on DB/publish errors has no backoff — could hot-loop
+  under a sustained outage.~~ **Resolved (Phase 15):** a capped
+  exponential local backoff (1s base, doubling, 30s cap) was added in
+  `apps/worker/src/consumer.ts` before both DB-error NACK paths.
+  Validated by a real, sustained PostgreSQL outage against the actual
+  Docker Compose stack: the worker's backoff was observed progressing
+  `1s -> 2s -> 4s -> 8s -> 16s -> 30s` (capped) without the worker
+  process being restarted, and the throttled job completed
+  successfully once Postgres recovered. The three unit tests written
+  for this fix have since also been run for real from the user's own
+  environment and passed (see `docs/incidents-and-failures.md`'s
+  Incident 9 and `docs/development-log.md`, Phase 15, for the full
+  breakdown of both the real Jest and real chaos-test evidence).
 - RabbitMQ per-message TTL only expires messages at the head of the
   queue — under mixed TTLs in the retry queue, expiry order is not
   strictly guaranteed by RabbitMQ's implementation. Not expected to

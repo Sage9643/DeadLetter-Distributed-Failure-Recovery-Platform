@@ -148,7 +148,10 @@ DLQ to catch them (if always NACKed).
 
 **Trade-offs:** NACK+requeue on DB errors has no backoff yet -- could
 hot-loop under a sustained DB outage. Accepted as a known limitation
-until Phase 4.
+until Phase 4. **Update (Phase 15):** addressed with a capped local
+backoff -- see the new Phase 15 decisions below and
+`docs/incidents-and-failures.md`'s Phase 15 entry for the current,
+honest validation status.
 
 ## Decision: Worker pool error handler uses structured logger, not console.error
 
@@ -1112,3 +1115,128 @@ notices immediately) that the project has not asked to have answered
 here, and changing it would be exactly the kind of "redesign a working
 system because you see a possible improvement" this project's
 guardrails explicitly warn against.
+
+## Decision: replace pool.on("error") => process.exit(1) with log-only handling
+
+**Context:** `apps/api/src/db/pool.ts` and `apps/worker/src/db/pool.ts`
+both called `process.exit(1)` on any pool-level `"error"` event --
+discovered during Phase 15's scoping review, not previously documented
+anywhere in this project. `pg.Pool` emits `"error"` for an
+already-connected, currently-IDLE client hitting a background/network
+failure; it does not mean the pool as a whole is unusable, and `pg.Pool`
+already discards that one client and creates a fresh one lazily on the
+next query. Neither app is process-supervised in this project's real
+deployment (`infra/docker-compose.yml` only runs `postgres`/
+`rabbitmq`; API/worker run via `npm run dev`), so this crash had no
+automatic recovery path at all.
+
+**Options considered:** (1) leave `process.exit(1)` -- fail fast and
+loud, relying on an external supervisor to restart the process; (2) log
+only, let `pg.Pool` self-heal.
+
+**Chosen approach:** (2). `pg.Pool`'s own internal behavior already
+makes a hard crash unnecessary for this specific event -- the pool
+does not need external intervention to keep working after one idle
+client errors.
+
+**Why:** option (1) directly contradicts Phase 14's own conclusion for
+the exact same class of problem (a dependency connection dying) on the
+RabbitMQ side: react to the failure signal and let the existing
+mechanism self-heal, rather than requiring a full process restart.
+There is also no supervisor in this project to make "fail fast and let
+something else restart it" a real recovery path -- in practice it was
+just "fail," permanently, until a human noticed.
+
+**Trade-offs:** this does reverse a Phase-0-era choice, even though
+that choice was never explicitly written down as a deliberate decision
+(no prior doc referenced it). Recording that trade-off here rather
+than silently flipping it. Every *foreground* query-error path (the
+outbox dispatcher's try/catch, the worker's DB-error catch blocks, the
+readiness route's `Promise.allSettled`) is untouched by this change --
+this only affects the pool's own *background* error event.
+
+## Decision: worker DB-error backoff is a local, in-process, capped counter -- not a DB-recorded retry
+
+**Context:** `apps/worker/src/consumer.ts`'s two DB-error catch blocks
+NACK-and-requeue immediately, with no delay -- flagged as a known
+limitation since Phase 4 ("could hot-loop under a sustained outage").
+
+**Options considered:** (1) route DB-error failures through the
+existing retry queue (TTL + DLX, the same mechanism `retryPolicy.ts`
+uses for business-logic failures); (2) a small, local, in-process
+capped-exponential backoff, sleeping before NACK, with a
+consecutive-error counter that lives only in memory.
+
+**Chosen approach:** (2).
+
+**Why:** option (1) is not actually available here -- recording a
+retry (via `markRetrying()`/`publishRetry()`) requires a successful DB
+write, which is precisely what just failed. The existing
+`isInvalidTextRepresentationError`/genuine-infrastructure-failure split
+already established that this class of error means "nothing was
+recorded, nothing CAN be recorded right now." A local, in-memory
+backoff sidesteps that entirely: no DB write attempted, no dependency
+on the thing that is down. The 1s-base/doubling/30s-cap shape
+deliberately mirrors Phase 14's `resubscribeWithBackoff`, but is kept
+as a fully separate mechanism and counter -- same separation principle
+Phase 14 used for connection-liveness backoff vs. job-processing retry
+backoff (`retryPolicy.ts`'s `calculateBackoffMs`), which remains
+completely untouched.
+
+**Trade-offs:** because the counter is per-worker-process and purely
+in-memory, it resets on any process restart and is not shared across
+multiple worker processes -- each worker independently throttles its
+own redelivery rate. With N worker processes, the aggregate
+redelivery rate during a sustained outage is bounded by N / (current
+backoff interval) rather than by a single shared budget. Considered
+sufficient for this project's scale; a shared/coordinated backoff
+would be meaningful overengineering for a problem this narrow.
+
+## Decision: mock the "pg" module for the pool-error and DB-error-backoff unit tests
+
+**Context:** a `pg.Pool`'s `"error"` event, and a sustained sequence of
+DB-query failures, cannot be deterministically triggered against a
+real, healthy `deadletter_test` database inside a Jest run.
+
+**Chosen approach:** `apps/api/src/__tests__/unit/poolErrorHandling.test.ts`,
+`apps/worker/src/__tests__/unit/poolErrorHandling.test.ts`, and
+`apps/worker/src/__tests__/unit/dbErrorBackoff.test.ts` `jest.mock("pg")`
+(for the pool tests) and `jest.mock("../../services/jobService")` /
+`jest.mock("../../processors/jobProcessor")` /
+`jest.mock("../../queue/retryPublisher")` (for the backoff test), the
+same narrow, deliberate exception to "test against real infrastructure"
+that Phase 14 established for `amqplib` -- for the identical reason:
+the specific failure signal under test is not otherwise triggerable at
+all inside a Jest run, real database or not. This does not replace a
+real chaos test against a genuine sustained Postgres outage, which
+remains the authoritative evidence (see incidents-and-failures.md,
+Phase 15 entry).
+
+## Decision: preserve the worker's initial-boot RabbitMQ-connect-failure exit, and every existing foreground DB-error handler, unchanged
+
+**Context:** Phase 15's fixes are specifically about the PostgreSQL
+pool's *background* error event and the worker's *DB-error* NACK
+paths. Two nearby, superficially-similar behaviors must NOT be
+confused with either of these.
+
+**Chosen approach:** `apps/worker/src/index.ts`'s
+`startConsumer().catch(err => { logger.error(...); process.exit(1); })`
+is untouched -- it is a one-time startup check on the RabbitMQ
+dependency, a different dependency and a different, deliberate Phase
+14 decision (see "preserve the worker's existing initial-boot-failure
+behavior unchanged" above), not the runtime PostgreSQL pool event this
+phase addresses. Likewise, every existing *foreground* query-error
+handler that was already correctly catching and handling a failed
+`pool.query()` call at its own call site (the outbox dispatcher's
+try/catch, `routes/health.ts`'s `Promise.allSettled`, the worker's own
+try/catch blocks around `claimJob`/`markCompleted`/`markRetrying`/
+`markDeadLettered`) is untouched -- Phase 15 only adds a backoff sleep
+immediately before the two NACK calls those handlers already had;
+their control flow and error classification are otherwise identical.
+
+**Why:** conflating "the pool had a background error" with "a
+foreground query just failed," or "PostgreSQL is unreachable" with
+"RabbitMQ is unreachable at boot," would blur two independently
+correct, already-decided behaviors for no benefit -- exactly the kind
+of unrelated-component modification this project's guardrails warn
+against.

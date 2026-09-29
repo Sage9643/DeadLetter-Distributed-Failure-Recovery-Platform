@@ -45,16 +45,22 @@ replay, and idempotency are eventually implemented — a message existing (or
 not existing) in RabbitMQ is never treated as authoritative; the database
 row is.
 
-## Open Design Question (tracked, not yet solved)
+## Open Design Question (resolved, Phase 10)
 
 **Consistency problem between PostgreSQL and RabbitMQ**: what happens if a
 job is written to PostgreSQL successfully but the RabbitMQ publish fails
-(or vice versa)? This is a classic dual-write problem. We are deliberately
-NOT solving this yet. Once Phase 2 implements the real publish path, we
-will attempt to reproduce this failure deliberately, observe actual
-behavior, and only then evaluate whether a pattern such as the transactional
-outbox is justified. See `docs/engineering-decisions.md` (to be created)
-once that analysis happens.
+(or vice versa)? This is a classic dual-write problem. This section
+originally deferred solving it until the problem was actually
+reproduced. It was reproduced (see incidents-and-failures.md,
+Deliberate Tests 2 and 3) on both the job-creation and replay paths,
+and resolved by Phase 10's transactional outbox -- both
+`POST /api/jobs` and `POST /:id/replay` now write to Postgres and
+record an outbox event in the same transaction, with a separate
+dispatcher publishing to RabbitMQ afterward. See "Phase 10 --
+Transactional Outbox (Durable Publication)" below and
+`docs/engineering-decisions.md` for the full design. Corrected during
+Phase 15's documentation review -- this section was previously stale,
+still describing the problem as unsolved.
 
 ## Infrastructure
 
@@ -465,3 +471,103 @@ against the actual Docker Compose stack demonstrated both the
 API/dispatcher and the worker/consumer recovering automatically, with
 neither process restarted. No recovery timing/duration was measured or
 is claimed.
+
+## PostgreSQL connection resilience & worker DB-error backoff (Phase 15)
+
+Addresses two related gaps in how both apps handle their PostgreSQL
+dependency failing or hiccuping -- one newly discovered during Phase
+15's scoping review, one previously self-identified and tracked since
+Phase 4.
+
+**Problem 1 (newly discovered, previously undocumented):**
+`apps/api/src/db/pool.ts` and `apps/worker/src/db/pool.ts` both
+attached a `pool.on("error", ...)` handler that called
+`process.exit(1)` on ANY pool-level error event. A `pg.Pool` emits
+`"error"` for an already-connected, currently-IDLE client hitting a
+background/network-level failure (e.g. Postgres restarting, a brief
+network blip) -- it does not mean every connection is unusable, and
+`pg.Pool` already discards the errored client internally and lazily
+creates a fresh one on the next query. Neither the API nor the worker
+is containerized or process-supervised in this project's real
+deployment (`infra/docker-compose.yml` only runs `postgres`/
+`rabbitmq`, both with `restart: unless-stopped`; the API and worker run
+via `npm run dev` on the host, no restart policy). A single transient
+Postgres blip therefore took down the entire API or worker process,
+with nothing to bring it back.
+
+**Problem 2 (previously tracked since Phase 4):**
+`failure-handling.md`'s "Known limitations" and
+`engineering-decisions.md`'s "Split ACK/NACK behavior by failure
+class" decision both flagged: *"NACK+requeue on DB/publish errors has
+no backoff -- could hot-loop under a sustained outage."* Confirmed
+still true in `apps/worker/src/consumer.ts`: both DB-error catch
+blocks called `channel.nack(msg, false, true)` unconditionally, with
+zero delay -- a sustained outage (short of triggering Problem 1's pool
+crash) could redeliver the same message as fast as RabbitMQ and the
+network allow.
+
+**Fix 1 -- pool error handling (both apps' `db/pool.ts`):** the
+`pool.on("error")` handler now only logs (via each app's existing
+structured logger -- `apps/api/src/db/pool.ts` was additionally
+switched from a raw `console.error` to the same pino `logger` already
+used everywhere else in that app). No `process.exit()` call remains in
+either file. This is deliberately narrow: it only changes the pool's
+*background* error handling. Every existing *foreground* query-error
+path (the outbox dispatcher's own try/catch, the worker's DB-error
+catch blocks below, `routes/health.ts`'s `Promise.allSettled`) is
+untouched -- those already handle a failing query correctly per-call-site.
+
+**Fix 2 -- worker DB-error backoff (`apps/worker/src/consumer.ts`):** a
+small, local, capped exponential backoff (1s base, doubling, capped at
+30s -- the same shape as Phase 14's `resubscribeWithBackoff`, but a
+separate, independent mechanism) is applied *before* `channel.nack(msg,
+false, true)` in both existing DB-error catch blocks (the initial
+`claimJob()` failure, and the "failed to record retry/dead-letter
+outcome" failure). A module-level consecutive-error counter drives the
+delay and is reset to 0 immediately after any `claimJob()` call that
+does not throw. Because the worker already runs with `prefetch(1)`
+(one message in flight at a time per process), sleeping before NACK
+directly throttles that worker's redelivery rate during a sustained
+outage without any RabbitMQ topology change, without a DB write to
+track the counter (the DB may be the thing that's down), and without
+touching the retry queue's TTL+DLX mechanism or `retryPolicy.ts`'s
+job-level backoff formula, which govern a completely different
+concern (business-logic processing retries, not infrastructure
+liveness).
+
+**Deliberately unchanged:** the outbox dispatcher
+(`apps/api/src/outbox/dispatcher.ts`) already tolerates DB errors
+adequately via its own per-event try/catch plus a 2-second poll
+interval that acts as its own natural backoff -- confirmed by reading
+`dispatchOutboxBatch`/`startOutboxDispatcher` during this phase's
+scoping; not modified. Phase 14's RabbitMQ connection-recovery logic
+(`queue/connection.ts` in both apps) is untouched. The worker's
+separate, intentional initial-boot RabbitMQ-connect-failure
+`process.exit(1)` in `index.ts` is untouched -- a different dependency
+and a different, unrelated decision (Phase 14). The normal
+job-processing retry/DLQ semantics (`retryPolicy.ts`, the retry
+queue's TTL+DLX mechanism) are untouched. No schema/migration change,
+no new RabbitMQ queue, no new dashboard route, no API route/contract
+change.
+
+**Validation status:** see `docs/development-log.md`'s Phase 15 entry
+and `docs/incidents-and-failures.md`'s Incident 9 for the full, honest
+accounting -- in short, real TypeScript builds passed for both apps,
+new unit tests were written against a mocked `pg` module (the same
+narrow, deliberate exception Phase 14 established for `amqplib`), each
+individually type-checked, and a real, sustained PostgreSQL outage
+against the actual Docker Compose stack was performed and passed: the
+worker (PID 5444) was not restarted, its DB-error backoff was observed
+progressing `1s -> 2s -> 4s -> 8s -> 16s -> 30s` (capped), and a
+legitimate queued job completed successfully (`attempt_count = 1`)
+once Postgres was restored, with `/ready` reporting both dependencies
+`"ok"` afterward. Real Jest execution has since also been confirmed
+from the user's own environment: API 19/19 suites (84/84 tests),
+Worker 6/6 suites (23/23 tests), 25/25 suites and 107/107 tests
+combined, including the three new Phase 15 unit tests. This session's
+own device-bridge shell still cannot execute Jest itself -- the real
+result came from the user's environment, as with every prior phase's
+Jest evidence. With both the real chaos test and real Jest execution
+now confirmed, Phase 15 is validated end to end: implemented,
+unit-tested (and those tests actually run and passing), and proven
+against a real, sustained PostgreSQL outage.

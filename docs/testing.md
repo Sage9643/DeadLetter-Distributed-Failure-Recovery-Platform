@@ -318,3 +318,59 @@ against the actual Docker Compose stack has now also been performed -- see
 incidents-and-failures.md, Incident 8, and development-log.md's Phase
 14 addendum -- providing the whole-system evidence these unit tests
 were never meant to substitute for.
+
+## Phase 15 -- mocked-"pg" unit tests
+
+A `pg.Pool`'s background `"error"` event, and a sustained sequence of
+DB-query failures, cannot be deterministically triggered against a
+real, healthy `deadletter_test` database inside a Jest run -- the same
+class of problem Phase 14 solved by mocking `amqplib` for its
+connection-recovery tests.
+
+`apps/api/src/__tests__/unit/poolErrorHandling.test.ts` and
+`apps/worker/src/__tests__/unit/poolErrorHandling.test.ts` each
+`jest.mock("pg")` with a small `EventEmitter`-based fake `Pool`, so a
+background `"error"` event can be emitted directly and the absence of
+`process.exit()` asserted deterministically (via a `process.exit` spy
+that throws instead of actually exiting the Jest worker, turning a
+regression into an ordinary failed assertion rather than a crashed test
+run).
+
+`apps/worker/src/__tests__/unit/dbErrorBackoff.test.ts` additionally
+mocks `services/jobService`, `processors/jobProcessor`, and
+`queue/retryPublisher` (on top of the same `amqplib` mock Phase 14
+established), so each DB-error and business-failure branch of the
+message handler can be driven deterministically -- asserting, using
+`jest.useFakeTimers()`/`advanceTimersByTimeAsync` (the same technique
+Phase 14's `consumerResubscribe.test.ts` used), that the first
+consecutive DB error waits the base ~1s delay before NACKing, a second
+consecutive error waits ~2s, a successful claim resets the counter
+back to the base delay, and a business-logic failure (not a DB error)
+is still ACKed immediately with no backoff at all. `computeDbErrorBackoffMs()`
+is also exported from `consumer.ts` and tested directly as a pure
+function for the 1s/2s/4s/8s/16s/30s-capped sequence, without needing
+any timers or mocks at all for that part.
+
+See `engineering-decisions.md`'s "mock the pg module" decision for the
+full reasoning, and `incidents-and-failures.md`'s Incident 9 for the
+real chaos re-test that was performed separately -- these unit tests
+prove the logic is internally correct on their own; the whole-system
+evidence that the fix survives a genuine, sustained Postgres outage
+came from that real chaos test, not from these mocks.
+
+**Real execution result:** confirmed from the user's own real
+environment -- API: 19/19 suites passed, 84/84 tests passed; Worker:
+6/6 suites passed, 23/23 tests passed (combined 25/25 suites, 107/107
+tests), including all three of these new Phase 15 test files. This
+session's own device-bridge shell still cannot execute Jest itself
+(`Preset ts-jest not found relative to rootDir`, reconfirmed again
+during this closeout) -- the real numbers above came from the user's
+environment, exactly as reported, not from this session. Getting Jest
+running for real also surfaced one small, related fix: both apps'
+`jest.setup.js` now load `.env.test` with dotenv's `override: true`,
+closing off the same class of stale-`DATABASE_URL`-shadowing risk
+diagnosed earlier during this phase's chaos testing. Both the unit
+tests and the system-level behavior they model are now independently
+confirmed: the unit tests by this real Jest run, and the system
+behavior by the real PostgreSQL chaos test (see `development-log.md`,
+Phase 15, and `incidents-and-failures.md`, Incident 9).

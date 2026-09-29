@@ -179,10 +179,16 @@ job re-failed post-replay (Test 1) AND after a job succeeded post-replay
 (Test 2). PostgreSQL remains the sole authority on whether a job is
 actually resolved; the DLQ is a permanent historical artifact.
 
-### Known limitation -- API RabbitMQ channel does not auto-recover
+### Known limitation -- API RabbitMQ channel does not auto-recover (resolved, Phase 14)
 
 Verified real (see incidents-and-failures.md): after RabbitMQ was
 stopped and restarted, the API's cached channel reference remained
 stale and unusable until the API process itself was restarted. This
-affects ALL API publishes (both original job creation and replay), not
-just replay specifically.
+affected ALL API publishes (both original job creation and replay), not
+just replay specifically. **Resolved in Phase 14** -- event-listener-
+driven cache invalidation, validated by a real RabbitMQ chaos test with
+neither the API nor the worker process restarted. See
+`docs/incidents-and-failures.md`, Incident 8's Phase 14 update, and
+`docs/architecture.md`'s "RabbitMQ connection recovery (Phase 14)"
+section. Corrected during Phase 15's documentation review -- this
+section was previously stale, still describing the gap as open.

@@ -1,7 +1,10 @@
 # Load Testing
 
-## Status: Scenarios A, B, and C executed with real results. Scenarios
-D and E not yet implemented.
+## Status: Scenarios A, B, C, D, and E have all been executed with real
+results (see below). This line previously read "Scenarios A, B, and C
+executed... D and E not yet implemented", which was stale -- D and E
+were already implemented and executed further down in this same file.
+Corrected during Phase 15's documentation review.
 
 ## Tooling
 
