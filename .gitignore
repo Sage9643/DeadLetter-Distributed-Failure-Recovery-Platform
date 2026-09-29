@@ -5,3 +5,6 @@ dist/
 *.tsbuildinfo
 tests/load/k6/results/
 tests/load/k6/data/
+# Phase 16: production compose env file -- real secrets, never
+# committed. The .example template alongside it IS tracked.
+infra/.env.production

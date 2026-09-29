@@ -1,0 +1,136 @@
+# Phase 16: PRODUCTION containerization. This is separate from
+# infra/docker-compose.yml (unchanged, still the local-dev file: just
+# Postgres + RabbitMQ, with api/worker/dashboard run on the host via
+# `npm run dev`, exactly as every prior phase's real chaos/load testing
+# has relied on). Introducing a second file rather than modifying the
+# existing one avoids breaking that established local-dev workflow.
+#
+# Architecture: the dashboard container (nginx) is the ONLY service
+# with a published host port. It serves the built static SPA and
+# reverse-proxies /api and /ws to the api service by Docker network
+# service name (see apps/dashboard/nginx.conf) -- the API is reachable
+# from outside this network only through that proxy. Postgres and
+# RabbitMQ (including its management UI) have NO published host ports
+# at all -- only services on the same Docker network (api, worker) can
+# reach them. This is a single-instance, single-region, one-VM/one-host
+# deployment shape (docker compose, not an orchestrator) -- no claim
+# of high availability is made anywhere in this file or its docs.
+#
+# Secrets: every credential below is read from the environment the
+# `docker compose` command itself is invoked with (a real .env file
+# passed via --env-file, or real shell-exported variables) --
+# nothing is hardcoded in this file, and nothing is baked into any
+# image (see each Dockerfile: they COPY only compiled dist/ output and
+# package.json, never a .env file). Deploying with the placeholder
+# ${POSTGRES_PASSWORD}/${RABBITMQ_PASSWORD}/${API_KEY} left unset will
+# fail loudly at container start (Postgres/RabbitMQ refuse empty
+# passwords; the API itself refuses to start in production without
+# API_KEY/CORS_ALLOWED_ORIGINS -- see apps/api/src/config/env.ts) --
+# it will not silently run insecurely.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-deadletter}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-deadletter}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-db:/docker-entrypoint-initdb.d:ro
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-deadletter} -d ${POSTGRES_DB:-deadletter}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    # No `ports:` -- deliberately not reachable from the host or the
+    # public internet, only from other services on the `internal`
+    # network (Phase 16 security baseline, item 11).
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-deadletter}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # No `ports:` -- neither the AMQP port nor the management UI (15672)
+    # is published. Only api/worker (on `internal`) can reach it.
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deadletter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-deadletter}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-deadletter}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set}@rabbitmq:5672
+      API_KEY: ${API_KEY:?API_KEY must be set}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:?CORS_ALLOWED_ORIGINS must be set}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - internal
+    # No `ports:` -- reachable only via the dashboard container's nginx
+    # proxy (or, in a split frontend/CDN deployment, via whatever
+    # reverse proxy/load balancer terminates HTTPS in front of it --
+    # see docs/deployment.md). Not directly published to the host here.
+
+  worker:
+    build:
+      context: ..
+      dockerfile: apps/worker/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-deadletter}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/${POSTGRES_DB:-deadletter}
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-deadletter}:${RABBITMQ_PASSWORD:?RABBITMQ_PASSWORD must be set}@rabbitmq:5672
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    networks:
+      - internal
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: apps/dashboard/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PUBLIC_PORT:-80}:80"
+    depends_on:
+      - api
+    networks:
+      - internal
+    # The ONLY service with a published host port -- the single public
+    # entry point for this deployment (Phase 16 target architecture).
+    # In front of this, terminate real HTTPS with a reverse proxy/load
+    # balancer or your hosting provider's edge (see docs/deployment.md)
+    # -- this container itself serves plain HTTP on the documented
+    # port, matching the existing dashboard dev setup.
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  rabbitmq_data:

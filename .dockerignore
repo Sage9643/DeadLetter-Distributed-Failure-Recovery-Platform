@@ -1,0 +1,11 @@
+node_modules
+**/node_modules
+dist
+**/dist
+.git
+*.log
+*.tsbuildinfo
+tests/load/k6/results
+tests/load/k6/data
+.env
+**/.env
