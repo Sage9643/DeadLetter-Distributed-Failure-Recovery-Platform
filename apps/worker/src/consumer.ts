@@ -171,15 +171,51 @@ async function subscribe(): Promise<void> {
         return;
       }
 
+      let processingSucceeded = false;
+      let processingErr: unknown;
       try {
         log.info("Executing processJob() -- this delivery won the claim and is now processing");
         await processJob(job);
-        await markCompleted(jobId);
-        const durationMs = Date.now() - claimedAt;
-        log.info({ durationMs }, "Job completed successfully");
-        channel.ack(msg);
+        processingSucceeded = true;
+      } catch (err) {
+        processingErr = err;
+      }
+
+      if (processingSucceeded) {
+        // Phase 16: markCompleted() is deliberately OUTSIDE processJob()'s
+        // try/catch (previously it was the second statement inside the
+        // same try block). If processJob() genuinely succeeds but this
+        // bookkeeping write then fails -- e.g. a concurrent stale-
+        // PROCESSING reclaim already moved the job to a different status
+        // -- that failure must never be routed through the retry/
+        // dead-letter classification below. Before this fix it was: the
+        // shared catch block would misrecord a job whose work genuinely
+        // succeeded as FAILED, using markCompleted's bookkeeping error as
+        // if it were the real processing failure, and could attempt an
+        // invalid markRetrying/markDeadLettered transition on top of it.
+        // We cannot durably record completion here, so the safest honest
+        // action is the same one every other unrecordable-outcome path in
+        // this function already takes: back off and let RabbitMQ
+        // redeliver -- see claimJob()'s DB-error path above and the
+        // retry/dead-letter recording-failure path below for the same
+        // pattern, reused here rather than inventing a new one.
+        try {
+          await markCompleted(jobId);
+          const durationMs = Date.now() - claimedAt;
+          log.info({ durationMs }, "Job completed successfully");
+          channel.ack(msg);
+        } catch (bookkeepingErr) {
+          log.error(
+            { err: bookkeepingErr },
+            "processJob() succeeded but markCompleted() failed to record it; requeueing (NOT treated as a processing failure)"
+          );
+          await backoffBeforeRequeue();
+          channel.nack(msg, false, true);
+        }
         return;
-      } catch (processingErr) {
+      }
+
+      {
         const message = processingErr instanceof Error ? processingErr.message : String(processingErr);
         const nonRetryable = processingErr instanceof NonRetryableError;
         const exhausted = job.attempt_count >= job.max_attempts;
