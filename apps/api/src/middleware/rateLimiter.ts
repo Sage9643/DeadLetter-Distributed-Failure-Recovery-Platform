@@ -58,10 +58,14 @@ interface Bucket {
 //
 // This header is NOT a security or trust mechanism: it is trivially
 // spoofable by anyone who can send an HTTP request, which is exactly why
-// it is refused outright once NODE_ENV === "production". Unlike
-// X-Forwarded-For, which this middleware never reads at all, there is no
-// attempt to "trust" this header in any deployment configuration --
-// it is a hard-coded development/test convenience, gated by environment.
+// it is refused outright once NODE_ENV === "production". This middleware
+// itself never reads X-Forwarded-For at all -- it only ever reads
+// req.ip (see defaultIdentify below), and any trust placed in
+// X-Forwarded-For is Express's own `trust proxy` resolution, configured
+// once in app.ts, not something this file decides or duplicates.
+// X-Test-Client-Id is a separate, hard-coded development/test
+// convenience, gated by environment, with no interaction with that
+// production trust configuration.
 const TEST_CLIENT_ID_HEADER = "x-test-client-id";
 
 export function defaultIdentify(req: Request): string {
@@ -71,12 +75,21 @@ export function defaultIdentify(req: Request): string {
       return `test:${testClientId}`;
     }
   }
-  // req.ip reflects Express's own resolution of the socket's remote
-  // address. Express's `trust proxy` setting defaults to false (and is
-  // never enabled anywhere in this codebase), so req.ip is NOT derived
-  // from X-Forwarded-For or any other client-supplied header -- it is
-  // the actual TCP connection's remote address, which a client cannot
-  // spoof from outside a trusted proxy hop.
+  // req.ip reflects Express's own resolution, per app.ts's
+  // `app.set("trust proxy", TRUST_PROXY_HOPS)` (TRUST_PROXY_HOPS = 1,
+  // see app.ts for the full rationale). With exactly one trusted hop,
+  // req.ip is the address the immediate connecting peer (nginx, in
+  // production -- see infra/docker-compose.prod.yml) reports via
+  // X-Forwarded-For's last entry, NOT an unbounded chain a caller could
+  // pad with fake entries -- Express/proxy-addr only ever looks exactly
+  // one hop past the real socket peer. In local dev/test, where nothing
+  // actually proxies requests to this process, req.ip still resolves to
+  // the real caller's socket address regardless of this setting (there
+  // is no intermediate hop for it to trust). A client that reaches this
+  // process directly rather than through the one trusted hop cannot
+  // spoof req.ip this way -- and in production, api has no published
+  // host port, so nginx is the only thing that ever can be that one
+  // trusted hop (see docs/security.md's "Network exposure" section).
   return req.ip ?? "unknown";
 }
 

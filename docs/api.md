@@ -343,9 +343,14 @@ engineering-decisions.md for why.
 
 Read by the rate limiter's client-identity logic ONLY when
 `NODE_ENV !== "production"`. Overrides `req.ip` for that request. This
-is NOT a security or trust mechanism -- unlike `req.ip` (derived from
-the actual TCP connection, which Express's default `trust proxy: false`
-never lets a client spoof via headers), this header is trivially
+is NOT a security or trust mechanism -- unlike `req.ip`, which a client
+cannot spoof from outside the trust boundary Express is configured
+with (`app.set("trust proxy", 1)` in `apps/api/src/app.ts`, trusting
+exactly the one reverse-proxy hop this project's production topology
+actually has -- see that file and `docs/security.md` for the full
+rationale; a bare `trust proxy: false` was used here before the Phase
+17 final audit found it silently broke per-client rate limiting once
+Phase 16 put nginx in front of the API), this header is trivially
 spoofable by any caller. It exists purely so tests and k6 runs (which,
 run from a single host, would otherwise all share one source IP) can
 exercise per-client rate-limit behavior deterministically. Ignored

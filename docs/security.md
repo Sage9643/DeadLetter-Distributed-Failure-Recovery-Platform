@@ -84,62 +84,90 @@ platform, which would be solving a problem this project doesn't have.
   exceeds `BACKPRESSURE_THRESHOLD`, protecting the outbox dispatcher
   from unbounded queue growth under load.
 
-## Rate limiting behind the production nginx proxy (found during the Phase 17 final audit)
+## Rate limiting behind the production nginx proxy (found and fixed, Phase 17 final audit)
 
 **The finding:** `middleware/rateLimiter.ts`'s `defaultIdentify()`
-keys each client's token bucket by `req.ip`, deliberately chosen
-because Express's `trust proxy` setting is `false` everywhere in this
-codebase -- `req.ip` is therefore always the real TCP socket's remote
-address, never derived from a client-suppliable header, which is what
-makes it safe to use as an identity key at all (see
-`docs/engineering-decisions.md`'s "X-Test-Client-Id" decision for the
-full reasoning). That reasoning was correct when written (Phase 12),
-before Phase 16 introduced `infra/docker-compose.prod.yml`'s
-nginx-fronted topology. In that topology, `dashboard`'s nginx is the
-ONLY container with a published host port, and it reverse-proxies
-`/api` to the `api` container (`apps/dashboard/nginx.conf`) -- so
-every request the `api` container ever sees, in production, arrives
-from ONE constant source: the nginx container's own address, not the
-real external client's. With `trust proxy` still `false`, `req.ip`
-inside `api` is always that same nginx address, so
-`defaultIdentify()`'s per-client bucketing collapses to a single
-shared bucket for all traffic that reaches these routes through the
-documented production entry point.
+keys each client's token bucket by `req.ip`. Before this fix,
+Express's `trust proxy` setting was `false` everywhere in this
+codebase, a decision that was correct when written (Phase 12) but
+predated Phase 16's `infra/docker-compose.prod.yml`, which puts
+`dashboard`'s nginx in front of the API as the ONLY container with a
+published host port, reverse-proxying `/api` to `api`
+(`apps/dashboard/nginx.conf`). With `trust proxy: false`, every
+request the `api` container saw in production arrived from ONE
+constant source -- nginx's own container address, not the real
+external client's -- so `defaultIdentify()`'s per-client bucketing
+silently collapsed into a single shared bucket for all traffic
+reaching these routes through the documented production entry point.
 
 **Real impact, assessed precisely:** low for this project's actual
-auth model, not zero. The two routes this affects
-(`POST /api/jobs`, `POST /api/jobs/:id/replay`) already require
-`requireApiKey`, and this project has exactly one shared operator API
-key by design (see "Authentication and authorization" above) -- there
-is no scenario today where two genuinely different, independently
--authenticated callers exist to unfairly share a bucket. GET routes,
-which the general public actually hits, are never rate-limited at all
-(also by design). This is therefore a real, previously-uncaught
-interaction bug -- the code's own stated invariant ("distinguishes
-clients by real IP") is not actually true in the shipped production
-topology -- but it does not currently expose a public multi-tenant
-fairness or DoS gap, because there is no multi-tenant traffic to be
-unfair between yet.
+auth model, not zero. The two affected routes (`POST /api/jobs`,
+`POST /api/jobs/:id/replay`) already require `requireApiKey`, and this
+project has exactly one shared operator API key by design (see
+"Authentication and authorization" above) -- there was no scenario
+today where two genuinely different, independently-authenticated
+callers existed to unfairly share a bucket. GET routes, which the
+general public actually hits, are never rate-limited at all (also by
+design). It was nonetheless a real, previously-uncaught bug: the
+code's own stated invariant ("distinguishes clients by real IP") was
+not actually true in the shipped production topology.
 
-**When this would need fixing:** before this project ever introduces
-more than one operator/API key sharing the same nginx front door, or
-before rate limiting is relied on as a public-facing defense in a
-topology where GET routes or unauthenticated traffic are ever rate
--limited too. The fix, if/when needed, is `app.set("trust proxy", 1)`
-in `apps/api/src/app.ts`, telling Express to trust exactly one hop
-(the immediate connecting proxy) and derive `req.ip` from
-`X-Forwarded-For`'s client-supplied entry instead of the raw socket
-address. This is safe specifically because of this project's
-topology -- `api` has no published port and is reachable only via the
-`internal` Docker network, so the "one trusted hop" really is always
-the dashboard's nginx, never an arbitrary external caller trying to
-spoof the header directly against `api`. That assumption would need
-re-checking if a different number of proxies is ever placed in front
-(e.g. a cloud load balancer added ahead of nginx) or if `api` is ever
-given a published port of its own. This was deliberately NOT changed
-during the Phase 17 final audit -- it is a trust-boundary/security
--configuration decision, not a self-contained bug fix, and is left for
-an explicit decision rather than a silent change.
+**The fix, applied:** `apps/api/src/app.ts` now calls
+`app.set("trust proxy", TRUST_PROXY_HOPS)` with `TRUST_PROXY_HOPS = 1`
+-- trusting exactly one reverse-proxy hop, immediately after
+`export const app = express();`, before any middleware or route is
+registered. `req.ip` now resolves from `X-Forwarded-For`'s entry as
+reported by that one trusted hop, correctly distinguishing real
+clients in production, while remaining unspoofable by anything that
+isn't that one trusted hop.
+
+**Why `1`, not `true`:** Express's `trust proxy: true` trusts an
+UNBOUNDED chain of `X-Forwarded-For` entries -- correct only when
+every hop between the real client and this process is a proxy you
+control, a claim this project cannot make in general (a future cloud
+load balancer or CDN placed in front of nginx would add a hop that
+`true` would blindly trust just as much as nginx itself, and a longer
+forged chain would still be believed). `trust proxy: 1` instead trusts
+only the immediate connecting peer's word for the client address and
+nothing earlier in any chain that peer forwards -- bounded, and an
+exact match for this project's actual documented topology (exactly
+one hop: nginx). A focused test
+(`apps/api/src/__tests__/unit/trustProxy.test.ts`) proves this
+boundedness directly: a request carrying a forged, multi-entry
+`X-Forwarded-For` chain (simulating an attempt to inject fake upstream
+hops) resolves to the entry the one trusted hop itself appended, not
+an attacker-controlled earlier entry in the same header.
+
+**Why this is safe specifically here, not in general:** `trust proxy`
+changes a trust boundary. Getting it wrong on a deployment where the
+API is directly reachable from untrusted networks would let any caller
+spoof `req.ip` via `X-Forwarded-For` and bypass the rate limiter
+entirely. It is safe in this project's production Compose topology
+specifically because `api` has NO published host port at all (see
+"Network exposure" below) -- the only thing that can ever be the "one
+trusted hop" reaching `api`'s socket is `nginx` itself, on the
+`internal` Docker network. In local dev/test (`npm run dev`, Jest),
+nothing actually proxies requests to this process, so `req.ip` already
+resolves directly to the real caller's socket address regardless of
+this setting -- trusting a hop that never exists there has no effect.
+If `api` is ever given a published port of its own, or an additional
+proxy/load balancer/CDN is ever placed in front of nginx, this value
+must be reconsidered -- see `apps/api/src/app.ts`'s own comment for
+the same rationale kept next to the code it describes.
+
+**Verification:** `apps/api/src/__tests__/unit/trustProxy.test.ts`
+proves, against the real Express app (via `supertest`, no database
+needed): (1) the real, exported `app` has `trust proxy` set to exactly
+`1`, never `true`; (2) two distinct clients, each presented through
+one trusted hop via a distinct `X-Forwarded-For` value, get separate
+rate-limit buckets; (3) a forged, multi-entry `X-Forwarded-For` chain
+cannot make an unbounded number of hops trusted -- only the value the
+one trusted hop itself supplied is used. The pre-existing
+`rateLimiter.test.ts`/`rateLimiter.concurrency.test.ts` unit suites,
+which exercise the limiter directly against mock `req.ip` values and
+never touch Express's trust-proxy resolution, were re-run unchanged
+and still pass, confirming this fix did not alter the limiter's own
+admission logic.
 
 ## Error handling
 

@@ -851,14 +851,29 @@ NODE_ENV=production and confirms the second is rejected as the SAME
 client.
 
 **Why this is not a trust mechanism:** `req.ip` is derived from
-Express's own resolution of the actual TCP connection's remote address
-(trust proxy is false everywhere in this codebase, so `req.ip` is never
-derived from X-Forwarded-For or any other client-supplied header). A
-real external client cannot spoof it. `X-Test-Client-Id`, by contrast,
-is trivially spoofable by design -- any caller can claim to be any
+Express's own resolution of the connection's remote address. A real
+external client cannot spoof it *from outside the trust boundary
+Express is configured with*. `X-Test-Client-Id`, by contrast, is
+trivially spoofable by design -- any caller can claim to be any
 client. It is a development/test convenience gated entirely by
 NODE_ENV, not a security boundary, and is documented as such directly
 in rateLimiter.ts's own comments.
+
+**Update (Phase 17 final audit):** this decision originally described
+`trust proxy` as false everywhere in this codebase -- true when
+written (Phase 12), before Phase 16 put nginx in front of the API in
+production. That combination meant `req.ip` in production was always
+nginx's own address, silently collapsing every client into one shared
+bucket -- a real bug, found during the Phase 17 final audit and fixed
+by setting `app.set("trust proxy", 1)` in `apps/api/src/app.ts`
+(exactly one trusted hop, not `true`/unbounded -- see that file's own
+comment for the full rationale and `docs/security.md`'s rate-limiting
+section for the safety argument). This decision's core point still
+holds with that fix in place: `req.ip` remains something a client
+cannot spoof from outside the trust boundary Express is configured
+with -- that boundary is now "exactly one hop," matching this
+project's actual documented topology, rather than "zero hops," which
+had quietly stopped matching that topology once nginx was introduced.
 
 **Trade-off:** None in production (the header is inert there). In
 non-production environments, anyone with network access to the API
