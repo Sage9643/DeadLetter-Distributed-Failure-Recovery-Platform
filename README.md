@@ -17,10 +17,19 @@ over `/ws` through nginx). Real chaos verification passed against this
 same production topology (`verify-chaos.js`: both a PostgreSQL outage
 and a RabbitMQ outage were genuinely induced, liveness stayed up,
 readiness correctly detected each failure, both services recovered,
-and real jobs completed after recovery). **Not yet deployed to the
-public internet** -- this is local validation of the production
-topology, not a live URL; see `docs/deployment.md` for exactly what
-that still requires. Phase 15's PostgreSQL/RabbitMQ chaos resilience
+and real jobs completed after recovery, with the worker's own logs
+confirming automatic RabbitMQ resubscription with no manual restart).
+Real latency measurement through the public nginx origin: sub-100ms
+even at p99 for liveness/readiness/authenticated job creation (see
+`docs/deployment.md`'s Status section for exact numbers). The full
+Jest suites now pass end-to-end against a live Postgres/RabbitMQ: API
+21/21 suites (97/97 tests), Worker 8/8 suites (28/28 tests) -- see
+`docs/testing.md`. The migration runner's existing-volume/idempotency
+behavior was proven for real (a temporary no-op migration added to an
+already-initialized database was applied once, then correctly skipped
+on re-run). **Not yet deployed to the public internet** -- this is
+local validation of the production topology, not a live URL; see
+`docs/deployment.md` for exactly what that still requires. Phase 15's PostgreSQL/RabbitMQ chaos resilience
 and Phase 14's RabbitMQ connection recovery remain validated against
 real outages on the local *development* stack. See
 `docs/development-log.md` for the full phase-by-phase history,

@@ -84,6 +84,63 @@ platform, which would be solving a problem this project doesn't have.
   exceeds `BACKPRESSURE_THRESHOLD`, protecting the outbox dispatcher
   from unbounded queue growth under load.
 
+## Rate limiting behind the production nginx proxy (found during the Phase 17 final audit)
+
+**The finding:** `middleware/rateLimiter.ts`'s `defaultIdentify()`
+keys each client's token bucket by `req.ip`, deliberately chosen
+because Express's `trust proxy` setting is `false` everywhere in this
+codebase -- `req.ip` is therefore always the real TCP socket's remote
+address, never derived from a client-suppliable header, which is what
+makes it safe to use as an identity key at all (see
+`docs/engineering-decisions.md`'s "X-Test-Client-Id" decision for the
+full reasoning). That reasoning was correct when written (Phase 12),
+before Phase 16 introduced `infra/docker-compose.prod.yml`'s
+nginx-fronted topology. In that topology, `dashboard`'s nginx is the
+ONLY container with a published host port, and it reverse-proxies
+`/api` to the `api` container (`apps/dashboard/nginx.conf`) -- so
+every request the `api` container ever sees, in production, arrives
+from ONE constant source: the nginx container's own address, not the
+real external client's. With `trust proxy` still `false`, `req.ip`
+inside `api` is always that same nginx address, so
+`defaultIdentify()`'s per-client bucketing collapses to a single
+shared bucket for all traffic that reaches these routes through the
+documented production entry point.
+
+**Real impact, assessed precisely:** low for this project's actual
+auth model, not zero. The two routes this affects
+(`POST /api/jobs`, `POST /api/jobs/:id/replay`) already require
+`requireApiKey`, and this project has exactly one shared operator API
+key by design (see "Authentication and authorization" above) -- there
+is no scenario today where two genuinely different, independently
+-authenticated callers exist to unfairly share a bucket. GET routes,
+which the general public actually hits, are never rate-limited at all
+(also by design). This is therefore a real, previously-uncaught
+interaction bug -- the code's own stated invariant ("distinguishes
+clients by real IP") is not actually true in the shipped production
+topology -- but it does not currently expose a public multi-tenant
+fairness or DoS gap, because there is no multi-tenant traffic to be
+unfair between yet.
+
+**When this would need fixing:** before this project ever introduces
+more than one operator/API key sharing the same nginx front door, or
+before rate limiting is relied on as a public-facing defense in a
+topology where GET routes or unauthenticated traffic are ever rate
+-limited too. The fix, if/when needed, is `app.set("trust proxy", 1)`
+in `apps/api/src/app.ts`, telling Express to trust exactly one hop
+(the immediate connecting proxy) and derive `req.ip` from
+`X-Forwarded-For`'s client-supplied entry instead of the raw socket
+address. This is safe specifically because of this project's
+topology -- `api` has no published port and is reachable only via the
+`internal` Docker network, so the "one trusted hop" really is always
+the dashboard's nginx, never an arbitrary external caller trying to
+spoof the header directly against `api`. That assumption would need
+re-checking if a different number of proxies is ever placed in front
+(e.g. a cloud load balancer added ahead of nginx) or if `api` is ever
+given a published port of its own. This was deliberately NOT changed
+during the Phase 17 final audit -- it is a trust-boundary/security
+-configuration decision, not a self-contained bug fix, and is left for
+an explicit decision rather than a silent change.
+
 ## Error handling
 
 - A centralized 4-argument Express error handler is registered last in
@@ -166,6 +223,37 @@ platform, which would be solving a problem this project doesn't have.
 - Verified by inspection during the Phase 17 security review: every
   service block in `infra/docker-compose.prod.yml` was checked for a
   `ports:` key. Only `dashboard` has one.
+
+## Container privileges and resource limits (found during the Phase 17 final audit)
+
+- **Privileges, verified by inspection:** `apps/api/Dockerfile` and
+  `apps/worker/Dockerfile` both explicitly run as `USER node` (the
+  non-root user `node:22-alpine` already defines) -- neither the API
+  nor the worker process runs as root inside its container. `postgres`
+  and `rabbitmq` run as whatever non-root user their own upstream
+  images default to (not overridden here, not audited further --
+  standard, widely-used official images). The `dashboard` container's
+  nginx master process runs as root by default (the standard
+  `nginx:alpine` image behavior; its worker processes, which actually
+  handle connections, drop to the `nginx` user) -- not overridden, and
+  in line with how that image is normally run.
+- **Resource limits: a real, currently-unaddressed gap.** No service
+  in `infra/docker-compose.prod.yml` declares a `deploy.resources`
+  block (or the older `mem_limit`/`cpus` Compose v2 fields) -- every
+  container can consume unbounded host CPU/memory. On the
+  single-VM/single-host shape this file already documents (no
+  orchestrator, no claimed high availability), one runaway container
+  (a memory leak, a pathological query, a burst of load) can starve
+  every other container on the same host, including Postgres and
+  RabbitMQ. This was not caught by any earlier phase and is not
+  implemented -- a real gap for a genuine production deployment, not
+  something to claim is handled. The fix is a `deploy.resources.limits`
+  entry per service once real resource usage under load has actually
+  been measured (guessing limits without measurement risks
+  under-provisioning and causing the exact outages this project's
+  resilience work is meant to survive) -- see
+  `docs/deployment.md`'s "What's actually required to complete this"
+  section.
 
 ## Logging
 

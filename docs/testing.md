@@ -49,14 +49,17 @@ DB/broker-independent unit suites could be run here):
   `consumer.ts`) and the pre-existing `dbErrorBackoff.test.ts`
   regression guard, still green.
 
-**Not yet confirmed from a real run:** the 3 DB-dependent suites added
-or exercised by Phase 16 -- API's `api/authRoute.test.ts` and
-worker's `integration/idempotency.test.ts` (both need a live Postgres)
--- plus a fresh full combined count across both apps including
-everything above. These require the project owner's own environment,
-exactly like the Phase 15 full-suite run did; see
-`docs/development-log.md`, Phase 16, for whether that has happened by
-the time you're reading this.
+**Confirmed in a real full run (Phase 17 final audit, the project
+owner's own environment, live Postgres/RabbitMQ):** API **21/21
+suites, 97/97 tests passed**; Worker **8/8 suites, 28/28 tests
+passed** -- this is the fresh full combined count (including the 3
+DB-dependent suites above: `api/authRoute.test.ts`,
+`integration/idempotency.test.ts`, and every other suite added since
+Phase 15) that the paragraph above once marked pending. It supersedes
+the Phase 15 closeout figures at the top of this section, which are
+kept only as historical record of what "most recent full run" meant
+at that earlier point in the project. See `docs/development-log.md`'s
+Phase 17 addendum for the full attribution.
 
 ## Framework
 

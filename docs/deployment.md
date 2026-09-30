@@ -39,7 +39,14 @@ Desktop environment, and validated end to end (Phase 17):
   entry for both (a missing `--env-file`, which meant the first attempt
   never actually stopped either service despite appearing to test
   something; and the recovery assertions not genuinely depending on
-  the outage having been observed).
+  the outage having been observed). The RabbitMQ sequence was also
+  independently confirmed in the worker's own real logs, showing
+  automatic resubscription with no manual restart: `"Worker waiting
+  for messages"` followed by `"Worker RabbitMQ consumer resubscribed
+  after disconnect"` -- the Phase 14 reconnect/resubscribe design
+  behaving as documented, under a real induced outage against the
+  production topology specifically (not just the dev stack Phase 14's
+  original chaos test used).
 - **Real WebSocket verification, run by the project owner:**
   `node apps/api/scripts/verify-ws.js` confirmed a real job created
   through the public `/api/jobs` endpoint produces a real
@@ -47,6 +54,17 @@ Desktop environment, and validated end to end (Phase 17):
   through nginx. One real bug in the verification script was found and
   fixed here too (it read the wrong field name from the job-creation
   response) -- the WebSocket/broadcaster path itself needed no changes.
+- **Real latency verification, run by the project owner:**
+  `node apps/api/scripts/verify-latency.js`, through the public nginx
+  origin, 50 requests per path: liveness (`GET /api/health`) 50/50
+  succeeded, p50 14.7ms / p95 23.7ms / p99 95.1ms; readiness
+  (`GET /api/health/ready`) 50/50 succeeded, p50 15.0ms / p95 19.1ms /
+  p99 22.8ms; authenticated job creation (`POST /api/jobs`) 50/50
+  succeeded, p50 15.4ms / p95 27.2ms / p99 34.2ms. These are the first
+  real numbers gathered for this script -- there is no prior
+  measurement to compare them against, and they describe this specific
+  local Docker Desktop environment, not a production host or network
+  path.
 
 **What this is not, yet:** this is local validation against Docker
 Desktop, not a public deployment. Nothing above is reachable from the
@@ -260,13 +278,23 @@ concern -- it already happened twice in this project's own history
 schema change had to be applied by hand against the live database
 because nothing else would have run it).
 
-**Verified so far:** the runner's connect-and-fail-fast behavior (no
-`DATABASE_URL` -> exits 1 with a clear message; unreachable database ->
-exits 1 with the real connection error) and its default migrations-
-directory path resolution were verified for real from this session.
-Actually applying it against a real database -- both a fresh one and
-an already-populated one -- has not yet been done from this session
-(no reachable Postgres here; see `docs/engineering-decisions.md`).
+**Verified for real, by the project owner, against the real stack
+(Phase 17 final audit):** migrations 001, 002, and 003 were applied
+for real via the `migrate` service. The existing-volume/idempotency
+case -- the specific gap this runner exists to close -- was then
+proven directly: a temporary no-op migration
+(`infra/migrations/004_test_noop.sql`, containing just `SELECT 1;`)
+was added to an already-initialized volume and picked up and applied
+on the next run; re-running `migrate` again afterward reported the
+database already up to date (no re-application, confirming the
+`schema_migrations` ledger works as designed); the temporary file was
+then deleted. This is exactly the "Existing-volume case" walkthrough
+below, now confirmed real rather than only described. (The runner's
+connect-and-fail-fast behavior -- no `DATABASE_URL` -> exits 1; an
+unreachable database -> exits 1 with the real connection error -- and
+its default migrations-directory path resolution were separately
+verified for real from this session, which has no reachable Postgres
+of its own; see `docs/engineering-decisions.md`.)
 **Exact commands to verify this yourself:**
 
 ```
@@ -381,16 +409,16 @@ static SPA shell still loads).
 Three scripts, all under `apps/api/scripts/`, written to be run against
 a real running `docker-compose.prod.yml` stack. Each is self-contained
 (plain Node, using only dependencies already installed for `apps/api`)
-and prints real pass/fail evidence rather than assuming success.
-`verify-ws.js` and `verify-chaos.js` have both now been run for real by
-the project owner against the real stack and passed (after fixing real
-bugs found in the scripts themselves -- see below and
-`docs/development-log.md`'s Phase 17 entry). `verify-latency.js` has
-not yet been run for real by anyone -- its numbers, when it is run,
-should be treated as the first real measurement, not compared against
-any prior claim (none exists). None of the three could be executed
-from THIS session specifically -- no Docker/reachable Postgres/
-RabbitMQ here, see `docs/engineering-decisions.md`.
+and prints real pass/fail evidence rather than assuming success. All
+three -- `verify-ws.js`, `verify-chaos.js`, and `verify-latency.js` --
+have now been run for real by the project owner against the real
+stack. `verify-ws.js` and `verify-chaos.js` passed after fixing real
+bugs found in the scripts themselves (see above and
+`docs/development-log.md`'s Phase 17 entry); `verify-latency.js`'s
+real numbers are reported in the Status section above and needed no
+script fix. None of the three could be executed from THIS session
+specifically -- no Docker/reachable Postgres/RabbitMQ here, see
+`docs/engineering-decisions.md`.
 
 ```
 DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/verify-ws.js

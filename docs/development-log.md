@@ -2594,21 +2594,100 @@ no Docker/reachable Postgres/RabbitMQ here -- see
 `docs/engineering-decisions.md`); the PASS results above are the
 project owner's own real runs, not reproduced here.
 
+### Phase 17 addendum 2 -- final production-readiness audit: full test run, latency numbers, and migration idempotency proven for real
+
+This addendum records the evidence gathered for the project's final
+production-readiness audit. Everything below was reported by the
+project owner from their own real environment; nothing here was
+reproduced from this session (still no reachable Docker/Postgres/
+RabbitMQ here -- see `docs/engineering-decisions.md`).
+
+**Full Jest suites, both apps, against the real Docker Compose test
+infrastructure (dev stack + `deadletter_test` database) -- the
+"fresh full combined count" the previous addendum's "Not yet
+verified" list was waiting on:** API **21/21 suites, 97/97 tests
+passed**. Worker **8/8 suites, 28/28 tests passed**. This is the
+first full-suite run since Phase 15's closeout (19/19 + 6/6, 84 + 23 =
+107 tests) to include every suite added by Phases 16 and 17 --
+`unit/auth.test.ts`, `api/authRoute.test.ts`,
+`unit/markCompletedFailure.test.ts`, and
+`integration/idempotency.test.ts` among them -- run end-to-end rather
+than only the DB-independent unit subset this session can reach. See
+`docs/testing.md` for where these figures now live.
+
+**Dashboard production build, run by the project owner:** `vite
+build` (via `npm run build -w apps/dashboard` or equivalent) completed
+successfully. This session's own dashboard build attempts remain
+blocked by a sandbox-local issue (`Cannot find module
+'@rollup/rollup-linux-x64-gnu'`, an npm optional-dependency resolution
+quirk specific to this sandbox's platform, not a project bug) -- the
+real build result comes entirely from the project owner's machine.
+
+**Migration runner idempotency, proven against a real,
+already-populated database volume -- closing the last open question
+about this Phase 17 mechanism:** migrations 001-003 were applied for
+real via the `migrate` Compose service. The project owner then
+followed `docs/deployment.md`'s own "Existing-volume case" walkthrough
+literally: added a temporary no-op migration
+(`infra/migrations/004_test_noop.sql`, `SELECT 1;`) to the
+already-initialized volume, re-ran `migrate`, and confirmed it was
+picked up and applied (proving a migration added after the volume
+already had data is not silently skipped -- the exact failure mode
+this runner was built to close, see this file's earlier Phase 17
+entry). Running `migrate` again afterward reported the database
+already up to date, with no re-application -- proving the
+`schema_migrations` ledger correctly recognizes already-applied work.
+The temporary file was deleted afterward and is not part of this
+project's real migration history.
+
+**Real latency measurement, through the public nginx origin
+(`verify-latency.js`), 50 requests per path -- the first real numbers
+this script has ever produced, not compared against any prior claim
+since none existed:**
+
+| Path | Success | p50 | p95 | p99 |
+|---|---|---|---|---|
+| `GET /api/health` (liveness) | 50/50 | 14.7ms | 23.7ms | 95.1ms |
+| `GET /api/health/ready` (readiness) | 50/50 | 15.0ms | 19.1ms | 22.8ms |
+| `POST /api/jobs` (authenticated) | 50/50 | 15.4ms | 27.2ms | 34.2ms |
+
+These describe one local Docker Desktop machine and network path, not
+a production host -- treat them as a baseline shape (sub-100ms even at
+p99, authenticated writes costing a few ms more than reads), not a
+representative production SLA.
+
+**Real chaos verification, re-confirmed with additional detail not
+previously captured:** the same `verify-chaos.js` run this file's
+prior addendum already recorded ALL PASSED for both PostgreSQL and
+RabbitMQ outages was independently corroborated in the worker
+process's own real logs for the RabbitMQ sequence specifically:
+`"Worker waiting for messages"` followed later by `"Worker RabbitMQ
+consumer resubscribed after disconnect"`, with no manual restart in
+between -- direct evidence that Phase 14's reconnect/resubscribe
+design (previously chaos-tested only against the local dev stack) also
+behaves correctly against the real production Compose topology.
+
+**Net effect on the previous addendum's "Not yet verified" list:**
+every item on it is now resolved by the evidence above. See the
+updated list immediately below.
+
 ### Not yet verified from this session (queued for the project owner)
 
-- Migration runner applied for real against both a fresh and an
-  already-populated database (the project owner's successful end-to-end
-  job completion through the real stack implies the schema was present
-  and correct, but an explicit `docker compose logs migrate` check
-  against both a fresh and an already-populated volume has not been
-  shown).
-- `verify-latency.js` run for real against the live stack -- not yet
-  run by anyone; no latency numbers exist yet to report anywhere.
-  `verify-ws.js` and `verify-chaos.js` have both now been run for real
-  and passed -- see the addendum above.
-- A fresh `docker compose -f infra/docker-compose.prod.yml up -d
-  --build` with this phase's changes (the removed `init-db` mount, the
-  new `migrate` service, the renamed `infra/migrations/` directory) --
-  the project owner's prior successful run predates these changes and
-  should be re-verified against them specifically.
-- Full DB-dependent Jest suites for both apps (see `docs/testing.md`).
+- ~~Migration runner applied for real against both a fresh and an
+  already-populated database.~~ **Resolved (Phase 17 addendum 2):**
+  001-003 applied fresh, 004_test_noop.sql proved the existing-volume/
+  idempotency case for real.
+- ~~`verify-latency.js` run for real against the live stack.~~
+  **Resolved (Phase 17 addendum 2):** real p50/p95/p99 numbers for all
+  three paths, see above.
+- ~~A fresh `docker compose ... up -d --build` with this phase's
+  changes.~~ **Resolved:** exercised as part of the migration-runner
+  verification above (the `migrate` service ran for real against this
+  exact Compose file).
+- ~~Full DB-dependent Jest suites for both apps.~~ **Resolved (Phase 17
+  addendum 2):** API 21/21 suites/97/97 tests, Worker 8/8 suites/28/28
+  tests, both real, both full runs.
+- Genuinely still open, not exercised by anything above: a **public**
+  deployment (a real host, domain, and TLS certificate) -- see
+  `docs/deployment.md`'s Status section. Everything verified so far is
+  local Docker Desktop validation, however thorough.
