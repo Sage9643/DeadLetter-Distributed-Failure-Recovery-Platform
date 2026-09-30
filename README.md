@@ -11,11 +11,19 @@ owner's own machine: all containers healthy, nginx correctly proxying
 `/api` and `/ws` to the API behind the dashboard's single public port,
 API-key auth confirmed (401 without a key), and a real job completing
 end-to-end (API -> Postgres/outbox -> RabbitMQ -> worker -> Postgres).
-**Not yet deployed to the public internet** -- this is local validation
-of the production topology, not a live URL; see `docs/deployment.md`
-for exactly what that still requires. Phase 15's PostgreSQL/RabbitMQ
-chaos resilience and Phase 14's RabbitMQ connection recovery remain
-validated against real outages. See `docs/development-log.md` for the
-full phase-by-phase history, `docs/architecture.md` for the current
-system design, `docs/security.md` for the security baseline, and
+Real WebSocket verification passed (`verify-ws.js`: a job created
+through the public API produced a real `job.updated` COMPLETED event
+over `/ws` through nginx). Real chaos verification passed against this
+same production topology (`verify-chaos.js`: both a PostgreSQL outage
+and a RabbitMQ outage were genuinely induced, liveness stayed up,
+readiness correctly detected each failure, both services recovered,
+and real jobs completed after recovery). **Not yet deployed to the
+public internet** -- this is local validation of the production
+topology, not a live URL; see `docs/deployment.md` for exactly what
+that still requires. Phase 15's PostgreSQL/RabbitMQ chaos resilience
+and Phase 14's RabbitMQ connection recovery remain validated against
+real outages on the local *development* stack. See
+`docs/development-log.md` for the full phase-by-phase history,
+`docs/architecture.md` for the current system design,
+`docs/security.md` for the security baseline, and
 `docs/deployment.md` for the deployment/migration procedure.

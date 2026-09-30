@@ -506,7 +506,10 @@ host. A separate production topology, `infra/docker-compose.prod.yml`,
 now containerizes the API and worker too, each with its own
 `Dockerfile` and Docker healthcheck/`depends_on: condition:
 service_healthy` gating -- see `docs/deployment.md`. That production
-topology has not yet been deployed anywhere; this incident's fix
+topology has since been run and validated on the project owner's real
+Docker Desktop environment (Phase 16 startup/health validation, Phase
+17 real chaos-outage verification for both Postgres and RabbitMQ), but
+has still not been deployed to any public host; this incident's fix
 [Phase 15's pool error handling below] is what actually protects both
 topologies, not containerization itself.)
 

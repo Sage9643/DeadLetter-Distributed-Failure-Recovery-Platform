@@ -173,6 +173,47 @@ platform, which would be solving a problem this project doesn't have.
   credentials) are never logged. `middleware/auth.ts` logs only
   whether a provided key matched, never the key value itself.
 
+## Dependency vulnerabilities (npm audit)
+
+Real `npm audit` results from this repository (Phase 17 final audit),
+distinguishing what actually reaches production from what doesn't --
+per this project's rule against blindly running
+`npm audit fix --force`, which can silently force semver-major
+upgrades and break things for a vulnerability that may not even apply
+to how this project uses the package:
+
+- `npm audit --omit=dev` (production dependencies only -- what
+  actually ships inside the Docker images described above): **0
+  vulnerabilities** at any severity, across 122 production
+  dependencies.
+- `npm audit` (including devDependencies): 5 findings -- 1 critical,
+  1 high, 3 moderate -- ALL in `vite`/`vitest`/`esbuild`/`vite-node`/
+  `@vitest/mocker`, the dashboard's build and test tooling. None of
+  these packages are installed in any production Docker image (each
+  Dockerfile's production stage runs `npm install --omit=dev`) or
+  shipped in the built static dashboard bundle (`vite build` output is
+  plain HTML/JS/CSS with no bundler code included).
+- **Why these are not treated as actionable right now:** every one of
+  them describes an attack against a locally *running* Vite dev server
+  or Vitest UI server being reached by an untrusted website or network
+  peer (e.g. "esbuild enables any website to send any requests to the
+  development server and read the response"). This project never runs
+  a Vite dev server or Vitest UI server anywhere reachable from
+  untrusted networks -- local development binds to localhost only, and
+  CI (`.github/workflows/ci.yml`) runs `vitest run`/`tsc -b && vite
+  build` headlessly, never as a listening server. The vulnerable code
+  path does not execute in this project's actual usage.
+- **Why not force-fixed anyway:** `npm audit`'s own `fixAvailable` for
+  every one of these requires a semver-major bump (vitest 4->5, vite
+  6->8, marked `isSemVerMajor: true`) -- exactly the kind of change
+  `npm audit fix --force` would make unattended, and exactly the kind
+  that deserves its own deliberate upgrade-and-retest pass (a major
+  Vite/Vitest bump can change build output, config format, or plugin
+  compatibility), not a reflexive fix applied during a security audit.
+  This is a genuine, named, low-priority gap -- see
+  `docs/development-log.md`'s Phase 17 entry -- not something claimed
+  as resolved.
+
 ## Deliberately out of scope
 
 Per this project's explicit anti-overengineering constraint, the

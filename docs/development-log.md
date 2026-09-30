@@ -2503,12 +2503,109 @@ isn't verified.
   plus a manual inspection of the parsed `depends_on` structure for
   `api`/`worker`).
 
+### Phase 17 addendum -- real WebSocket and chaos verification (real bugs found, fixed, and both scripts now passed for real)
+
+Both remaining unverified scripts from this phase's first pass have
+since been run for real by the project owner against the real stack.
+Each run first exposed a real bug -- in the verification script
+itself, not in the WebSocket/API/worker/database/RabbitMQ code -- which
+was fixed here and then re-run successfully by the project owner. This
+addendum documents both rounds accurately, including the two real
+bugs, so the eventual PASS is not misread as first-try success.
+
+**`verify-ws.js`: real bug found and fixed.** First real run: the
+script printed `Job created: id=undefined` and then failed waiting for
+events matching `undefined`. Root cause, confirmed by direct
+inspection: `POST /api/jobs` (`apps/api/src/routes/jobs.ts`) returns
+`{ jobId, status }`, but the script read `created.id`. The
+WebSocket/broadcaster/route/worker code was already correct and
+internally consistent (all used `jobId`), confirmed by the same run's
+own log showing correct `job.updated` broadcasts carrying real job
+IDs -- this was a pure verification-script bug. Fixed by extracting a
+small pure function, `extractJobId(body)`, returning `body &&
+body.jobId`, and strengthening the wait to require a `job.updated`
+event with `status === "COMPLETED"` specifically for that job ID
+(previously the first matching event of any status would do), with all
+events seen for that job reported on timeout for easier debugging. A
+focused test, `apps/api/scripts/__tests__/extractJobId.test.js` (3
+`node:test` cases: real response shape, wrong/legacy shape returns
+`undefined`, null/undefined/empty input does not throw), was added
+alongside it.
+
+Real re-run by the project owner, against the real production stack
+through nginx: `node apps/api/scripts/verify-ws.js` -- connected to
+`ws://localhost:8080/ws`, created a real job through the public
+`/api/jobs` endpoint, correctly extracted its real `jobId`, and
+received a real `job.updated` event with `status: "COMPLETED"` for
+that exact job over the WebSocket. PASSED.
+
+**`verify-chaos.js`: real bugs found and fixed (two).** First real run
+surfaced two distinct problems. (1) Every `docker compose` command the
+script issued (`stop postgres`, `start postgres`, `stop rabbitmq`,
+`start rabbitmq`) failed before touching any container, because none
+of them passed `--env-file infra/.env.production`, so Compose could not
+resolve interpolated variables (`RABBITMQ_PASSWORD`,
+`POSTGRES_PASSWORD` missing) and aborted with a config error. (2) The
+script's independent-step design meant a line like `Readiness recovers
+(postgres:ok)` could print PASS purely because readiness had never
+actually changed -- not because a real outage was observed and
+recovered from. Confirmed by the project owner's own evidence:
+readiness stayed `{"postgres":"ok","rabbitmq":"ok"}` throughout, proving
+neither service was ever actually stopped. As with `verify-ws.js`, this
+was entirely a verification-script bug -- no change was made to the
+API, worker, database, or RabbitMQ resilience implementation.
+
+Fixed by extracting `buildComposeCommand(composeFile, envFile, args)`,
+a small pure function that every `docker compose` invocation in the
+script now goes through, so `--env-file` (configurable via the
+`ENV_FILE` environment variable, defaulting to
+`infra/.env.production`) is applied consistently to every call with no
+way for a new call site to accidentally omit it. Added a
+`docker compose ... config --quiet` preflight check that aborts the
+whole run immediately if the Compose file can't even be resolved,
+before any outage is attempted. Replaced the independent per-step
+`step()` calls with `runOutageSequence(serviceName, statusField)`,
+which makes "recovers" assertions strictly conditional on the outage
+having actually been observed (the readiness field genuinely flipped
+to an error state) and the restart command having actually succeeded
+-- a stop that never took effect can no longer produce a false
+"recovered" PASS. A focused test,
+`apps/api/scripts/__tests__/composeCommand.test.js` (4 `node:test`
+cases covering presence, consistency across services, and override via
+`ENV_FILE`), was added alongside it.
+
+Real re-run by the project owner, against the real production stack:
+`node apps/api/scripts/verify-chaos.js` -- PostgreSQL outage: all
+checks passed (API liveness stayed up throughout, readiness correctly
+reported the outage, the service was genuinely stopped and restarted,
+a real job submitted after recovery completed). RabbitMQ outage: same
+full sequence, all checks passed. Overall: ALL PASSED. This is the
+first genuine chaos-recovery evidence for this project's production
+Compose topology specifically (the RabbitMQ- and Postgres-outage chaos
+tests from Phases 12 and 15 were against the development stack, not
+this one).
+
+**Real evidence gathered from this session for both fixes:**
+`node --test 'apps/api/scripts/__tests__/*.test.js'` -- 7/7 passed (3
+`extractJobId.test.js` + 4 `composeCommand.test.js`); `node --check` on
+both modified scripts -- clean syntax. Neither script's live,
+stack-dependent path could be executed from this session itself (still
+no Docker/reachable Postgres/RabbitMQ here -- see
+`docs/engineering-decisions.md`); the PASS results above are the
+project owner's own real runs, not reproduced here.
+
 ### Not yet verified from this session (queued for the project owner)
 
 - Migration runner applied for real against both a fresh and an
-  already-populated database.
-- `verify-ws.js`, `verify-latency.js`, `verify-chaos.js` run for real
-  against the live stack.
+  already-populated database (the project owner's successful end-to-end
+  job completion through the real stack implies the schema was present
+  and correct, but an explicit `docker compose logs migrate` check
+  against both a fresh and an already-populated volume has not been
+  shown).
+- `verify-latency.js` run for real against the live stack -- not yet
+  run by anyone; no latency numbers exist yet to report anywhere.
+  `verify-ws.js` and `verify-chaos.js` have both now been run for real
+  and passed -- see the addendum above.
 - A fresh `docker compose -f infra/docker-compose.prod.yml up -d
   --build` with this phase's changes (the removed `init-db` mount, the
   new `migrate` service, the renamed `infra/migrations/` directory) --

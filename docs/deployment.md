@@ -27,6 +27,26 @@ Desktop environment, and validated end to end (Phase 17):
   IPv4 -- the healthcheck itself was failing even though nginx was
   completely fine. Fixed to `http://127.0.0.1:80/` (see
   `apps/dashboard/Dockerfile`).
+- **Real chaos verification, run by the project owner against this
+  same real stack:** `node apps/api/scripts/verify-chaos.js` --
+  PostgreSQL outage: all checks passed (liveness stayed up, readiness
+  correctly reported `postgres:error`, service recovered, a real job
+  submitted after recovery completed). RabbitMQ outage: all checks
+  passed (same sequence, `rabbitmq:error` correctly reported, real
+  recovery, real job completed). Overall: ALL PASSED. Two real bugs in
+  the verification script itself were found and fixed to get a
+  trustworthy result here -- see `docs/development-log.md`'s Phase 17
+  entry for both (a missing `--env-file`, which meant the first attempt
+  never actually stopped either service despite appearing to test
+  something; and the recovery assertions not genuinely depending on
+  the outage having been observed).
+- **Real WebSocket verification, run by the project owner:**
+  `node apps/api/scripts/verify-ws.js` confirmed a real job created
+  through the public `/api/jobs` endpoint produces a real
+  `job.updated` (status `COMPLETED`) broadcast received over `/ws`
+  through nginx. One real bug in the verification script was found and
+  fixed here too (it read the wrong field name from the job-creation
+  response) -- the WebSocket/broadcaster path itself needed no changes.
 
 **What this is not, yet:** this is local validation against Docker
 Desktop, not a public deployment. Nothing above is reachable from the
@@ -359,11 +379,18 @@ static SPA shell still loads).
 ## Verification scripts (Phase 17)
 
 Three scripts, all under `apps/api/scripts/`, written to be run against
-a real running `docker-compose.prod.yml` stack (none of them could be
-executed from this session -- no Docker/reachable Postgres/RabbitMQ
-here, see `docs/engineering-decisions.md`). Each is self-contained
+a real running `docker-compose.prod.yml` stack. Each is self-contained
 (plain Node, using only dependencies already installed for `apps/api`)
 and prints real pass/fail evidence rather than assuming success.
+`verify-ws.js` and `verify-chaos.js` have both now been run for real by
+the project owner against the real stack and passed (after fixing real
+bugs found in the scripts themselves -- see below and
+`docs/development-log.md`'s Phase 17 entry). `verify-latency.js` has
+not yet been run for real by anyone -- its numbers, when it is run,
+should be treated as the first real measurement, not compared against
+any prior claim (none exists). None of the three could be executed
+from THIS session specifically -- no Docker/reachable Postgres/
+RabbitMQ here, see `docs/engineering-decisions.md`.
 
 ```
 DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/verify-ws.js

@@ -17,6 +17,25 @@ Phase 16 added 4 new test files: API `unit/auth.test.ts`,
 `integration/idempotency.test.ts`. `npx jest --listTests` now reports
 21 suites for API (up from 19) and 8 suites for worker (up from 6).
 
+**Phase 17 addition -- a second, separate test runner for
+non-Jest-scope scripts.** `apps/api/scripts/*.js` (the WebSocket/
+latency/chaos production verification scripts) live outside apps/api's
+Jest `src/__tests__` root by design (they are standalone operational
+scripts, not part of the API application). Two of them have focused
+regression tests using Node's own built-in test runner
+(`node:test`/`node:assert`) rather than being pulled into Jest's
+config for a couple of pure functions:
+`apps/api/scripts/__tests__/extractJobId.test.js` (3 tests) and
+`apps/api/scripts/__tests__/composeCommand.test.js` (4 tests). Run
+with:
+```
+node --test 'apps/api/scripts/__tests__/*.test.js'
+```
+Real, verified: 7/7 passed (both files run together, confirming no
+interference). These are NOT counted in the Jest suite/test totals
+above -- a different runner, a different directory, tracked here
+separately.
+
 **Real, verified evidence for Phase 16's own change set specifically**
 (run from this session's device-bridge shell, which has no reachable
 Postgres/RabbitMQ -- see `docs/engineering-decisions.md` -- so only the
