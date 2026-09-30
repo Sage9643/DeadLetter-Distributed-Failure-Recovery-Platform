@@ -21,11 +21,29 @@ const baseJob = {
 
 describe("JobDetail", () => {
   beforeEach(() => {
+    // Restores any spy (including window.prompt, spied on per-test
+    // below) to its original jsdom implementation before the NEXT
+    // test runs, so a prompt mock from one test can never leak into
+    // another. Also clears sessionStorage so a stored operator API key
+    // from one test (handleReplay() -> setStoredApiKey() on a
+    // successful prompt) never lets a LATER test skip the prompt --
+    // every replay test below exercises the exact same
+    // getStoredApiKey() -> null -> window.prompt() -> handler path,
+    // deterministically, regardless of test order.
     vi.restoreAllMocks();
+    sessionStorage.clear();
   });
 
   it("shows a replay button for DEAD_LETTERED jobs and handles success", async () => {
     vi.spyOn(client, "replayJob").mockResolvedValue({ jobId: baseJob.id, status: "QUEUED", replayCount: 1 });
+    // jsdom does not implement window.prompt (throws "Not implemented:
+    // window.prompt" if called for real) -- handleReplay() calls it
+    // first, before ever reaching replayJob(), whenever no operator key
+    // is already stored. Stubbing a truthy return value lets the
+    // handler proceed exactly as it would for a real operator entering
+    // a key, so this test genuinely exercises handleReplay()'s full
+    // path into the replayJob() mock above, not just the prompt itself.
+    vi.spyOn(window, "prompt").mockReturnValue("test-operator-key");
     const onReplayed = vi.fn();
     render(<JobDetail job={baseJob} onBack={() => {}} onReplayed={onReplayed} />);
 
@@ -39,6 +57,10 @@ describe("JobDetail", () => {
 
   it("shows a 409 conflict message on replay", async () => {
     vi.spyOn(client, "replayJob").mockRejectedValue(new client.ApiError(409, { error: "conflict" }));
+    // See the success test above for why this is needed: handleReplay()
+    // calls window.prompt() before replayJob(), and jsdom's real
+    // implementation throws rather than returning a value.
+    vi.spyOn(window, "prompt").mockReturnValue("test-operator-key");
     render(<JobDetail job={baseJob} onBack={() => {}} onReplayed={() => {}} />);
 
     fireEvent.click(screen.getByText("Replay Job"));
@@ -50,6 +72,10 @@ describe("JobDetail", () => {
 
   it("shows a 404 message on replay", async () => {
     vi.spyOn(client, "replayJob").mockRejectedValue(new client.ApiError(404, { error: "not found" }));
+    // See the success test above for why this is needed: handleReplay()
+    // calls window.prompt() before replayJob(), and jsdom's real
+    // implementation throws rather than returning a value.
+    vi.spyOn(window, "prompt").mockReturnValue("test-operator-key");
     render(<JobDetail job={baseJob} onBack={() => {}} onReplayed={() => {}} />);
 
     fireEvent.click(screen.getByText("Replay Job"));
