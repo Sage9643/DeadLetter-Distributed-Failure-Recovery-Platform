@@ -14,20 +14,41 @@
 //
 //   DASHBOARD_URL=http://localhost:8080 API_KEY=<your real API key> \
 //     [COMPOSE_FILE=infra/docker-compose.prod.yml] \
+//     [ENV_FILE=infra/.env.production] \
 //     node apps/api/scripts/verify-chaos.js
 //
 // Requires `docker compose` to be runnable from this shell against the
 // already-running stack (same machine, same working directory context
 // as when you brought the stack up).
+//
+// Phase 17 addendum -- real bug found and fixed here: every
+// `docker compose` command this script runs MUST use the same
+// --env-file the stack was actually started with
+// (infra/.env.production -- see docs/deployment.md's "Startup
+// procedure"). Without it, `docker compose stop/start` cannot resolve
+// this project's required interpolated variables (POSTGRES_PASSWORD,
+// RABBITMQ_PASSWORD, ...) and fails immediately, BEFORE touching any
+// container. A real run hit exactly this: `stop postgres` and
+// `stop rabbitmq` both failed with "variable is missing", so neither
+// service was ever actually stopped -- readiness stayed
+// {"postgres":"ok","rabbitmq":"ok"} throughout, and the script's old
+// step-independent structure let later steps ("readiness recovers")
+// report PASS anyway, because nothing had ever gone down to recover
+// from. Both problems are fixed below: every compose command now
+// passes --env-file, and the pass/fail logic for each service's outage
+// is now a single dependent sequence -- "recovers" can only be
+// asserted true if the outage was actually, verifiably observed first.
 
 const { execSync } = require("child_process");
+const fs = require("fs");
 
 const DASHBOARD_URL = (process.env.DASHBOARD_URL || "http://localhost:8080").replace(/\/$/, "");
 const API_KEY = process.env.API_KEY;
 const COMPOSE_FILE = process.env.COMPOSE_FILE || "infra/docker-compose.prod.yml";
+const ENV_FILE = process.env.ENV_FILE || "infra/.env.production";
 const RECOVERY_TIMEOUT_MS = Number(process.env.RECOVERY_TIMEOUT_MS || 60000);
 
-if (!API_KEY) {
+if (require.main === module && !API_KEY) {
   console.error("verify-chaos: API_KEY environment variable is required.");
   process.exit(1);
 }
@@ -36,10 +57,31 @@ function log(msg) {
   console.log(`[verify-chaos ${new Date().toISOString()}] ${msg}`);
 }
 
+// Extracted as a pure function (no side effects) so it can be tested
+// directly -- see scripts/__tests__/composeCommand.test.js -- without
+// needing Docker or a live stack. This is the exact fix for the real
+// bug above: every compose invocation goes through this one function,
+// so --env-file is applied consistently everywhere (stop, start, and
+// the emergency restore-on-crash path at the bottom of this file) with
+// nothing to fall out of sync.
+function buildComposeCommand(composeFile, envFile, args) {
+  return `docker compose -f ${composeFile} --env-file ${envFile} ${args}`;
+}
+
 function compose(args) {
-  const cmd = `docker compose -f ${COMPOSE_FILE} ${args}`;
+  const cmd = buildComposeCommand(COMPOSE_FILE, ENV_FILE, args);
   log(`$ ${cmd}`);
-  return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    return execSync(cmd, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  } catch (err) {
+    // execSync's thrown error already carries err.stdout/err.stderr,
+    // but they're easy to lose in a generic catch -- surface stderr
+    // explicitly so a failure like a missing --env-file variable is
+    // immediately visible in this script's own output, not just in a
+    // buried exception message.
+    const stderr = err && err.stderr ? String(err.stderr).trim() : "";
+    throw new Error(`command failed: ${cmd}${stderr ? `\n${stderr}` : ""}`);
+  }
 }
 
 async function sleep(ms) {
@@ -96,20 +138,143 @@ async function createJobAndWaitForCompletion(label, timeoutMs) {
 
 const results = [];
 
-async function step(name, fn) {
-  log(`--- ${name} ---`);
+function record(name, ok, reason) {
+  results.push({ name, ok, reason });
+  log(`${ok ? "PASS" : "FAIL"}: ${name}${reason ? " -- " + reason : ""}`);
+}
+
+// One dependent sequence per dependency (postgres / rabbitmq), instead
+// of independent steps that each ran regardless of what came before.
+// This is the fix for the second real bug: "readiness recovers" can
+// now only be recorded true if the outage was actually, verifiably
+// observed (readiness genuinely reported this service as failing)
+// AND the restart command itself succeeded. If either precondition
+// isn't met, "recovers" is recorded FALSE with an explicit reason --
+// it is never silently skipped in a way that could read as a pass.
+async function runOutageSequence(serviceName, statusField) {
+  log(`=== ${serviceName} outage sequence ===`);
+
+  let stopOk = false;
   try {
-    const result = await fn();
-    results.push({ name, ...result });
-    log(`${result.ok ? "PASS" : "FAIL"}: ${name}${result.reason ? " -- " + result.reason : ""}`);
+    compose(`stop ${serviceName}`);
+    stopOk = true;
+    record(`Stop ${serviceName}`, true);
   } catch (err) {
-    results.push({ name, ok: false, reason: String(err) });
-    log(`FAIL (exception): ${name} -- ${err}`);
+    record(`Stop ${serviceName}`, false, err.message);
   }
+
+  if (!stopOk) {
+    record(
+      `${serviceName} outage sequence aborted`,
+      false,
+      `stop ${serviceName} failed -- cannot safely continue this dependency's chaos sequence (see docs/deployment.md's Startup procedure for the required --env-file)`
+    );
+    // Nothing was stopped, so there is nothing to restore -- but
+    // attempt a `start` anyway in case the failure happened partway
+    // through Docker's own handling of the command; harmless no-op if
+    // the service was never touched.
+    try {
+      compose(`start ${serviceName}`);
+    } catch {
+      // best-effort
+    }
+    return;
+  }
+
+  await sleep(2000);
+
+  const liveDuringOutage = await getLive();
+  record(
+    `API stays alive (liveness) while ${serviceName} is down`,
+    liveDuringOutage.status === 200,
+    liveDuringOutage.status !== 200 ? `liveness returned ${liveDuringOutage.status}` : undefined
+  );
+
+  const readyDuringOutage = await getReady();
+  const outageObserved =
+    readyDuringOutage.status === 503 && readyDuringOutage.body && readyDuringOutage.body[statusField] === "error";
+  record(
+    `Readiness correctly reports ${serviceName} as failing`,
+    outageObserved,
+    outageObserved
+      ? undefined
+      : `expected 503/${statusField}:error, got ${readyDuringOutage.status} ${JSON.stringify(readyDuringOutage.body)}`
+  );
+
+  let restartOk = false;
+  try {
+    compose(`start ${serviceName}`);
+    restartOk = true;
+    record(`Restart ${serviceName}`, true);
+  } catch (err) {
+    record(`Restart ${serviceName}`, false, err.message);
+  }
+
+  // The dependent gate: "recovers" is only ever asserted true if the
+  // outage was genuinely observed AND the restart command succeeded.
+  // Either failure makes recovery unverifiable, not something to
+  // silently skip -- record it as a real failure with the reason.
+  if (!outageObserved) {
+    record(
+      `Readiness recovers (${serviceName})`,
+      false,
+      `not verifiable -- the outage itself was never observed (readiness never reported ${serviceName}:error), so recovery cannot be meaningfully asserted`
+    );
+    return;
+  }
+  if (!restartOk) {
+    record(`Readiness recovers (${serviceName})`, false, `restart command failed, cannot verify recovery`);
+    return;
+  }
+
+  const deadline = Date.now() + RECOVERY_TIMEOUT_MS;
+  let recovered = false;
+  let last;
+  while (Date.now() < deadline) {
+    last = await getReady();
+    if (last.status === 200 && last.body && last.body[statusField] === "ok") {
+      recovered = true;
+      break;
+    }
+    await sleep(1000);
+  }
+  record(
+    `Readiness recovers (${serviceName})`,
+    recovered,
+    recovered ? undefined : `did not recover within ${RECOVERY_TIMEOUT_MS}ms; last=${JSON.stringify(last)}`
+  );
+
+  if (!recovered) {
+    return;
+  }
+
+  const workerResult = await createJobAndWaitForCompletion(`after-${serviceName}-outage`, 30000);
+  record(`Worker recovers: a real job submitted after ${serviceName} recovery completes`, workerResult.ok, workerResult.reason);
 }
 
 async function main() {
-  log(`Chaos smoke test against ${DASHBOARD_URL} using ${COMPOSE_FILE}`);
+  log(`Chaos smoke test against ${DASHBOARD_URL} using ${COMPOSE_FILE} (--env-file ${ENV_FILE})`);
+
+  if (!fs.existsSync(ENV_FILE)) {
+    console.error(
+      `Aborting: ENV_FILE '${ENV_FILE}' does not exist. This must be the same env file the stack was started ` +
+        `with (see docs/deployment.md's "Startup procedure") -- without it, docker compose cannot resolve this ` +
+        `project's required variables and every stop/start command will fail before touching any container. ` +
+        `Set ENV_FILE=<path> if your real file lives somewhere else.`
+    );
+    process.exit(1);
+  }
+
+  // Fail fast and loud on exactly the class of problem that caused the
+  // real bug this addendum fixes: if docker compose can't even resolve
+  // its config with this compose file + env file, nothing below this
+  // point can be trusted, so don't proceed and risk a false PASS.
+  try {
+    compose("config --quiet");
+  } catch (err) {
+    console.error(`Aborting: docker compose could not resolve its configuration with ${COMPOSE_FILE} and --env-file ${ENV_FILE}:\n${err.message}`);
+    process.exit(1);
+  }
 
   const baseline = await getReady();
   if (baseline.status !== 200) {
@@ -118,87 +283,8 @@ async function main() {
   }
   log(`Baseline readiness OK: ${JSON.stringify(baseline.body)}`);
 
-  // --- PostgreSQL outage ---
-  await step("Stop postgres", async () => {
-    compose("stop postgres");
-    return { ok: true };
-  });
-
-  await sleep(2000);
-
-  await step("API stays alive (liveness) while Postgres is down", async () => {
-    const live = await getLive();
-    return { ok: live.status === 200, reason: live.status !== 200 ? `liveness returned ${live.status}` : undefined, detail: live };
-  });
-
-  await step("Readiness correctly reports Postgres as failing", async () => {
-    const ready = await getReady();
-    const ok = ready.status === 503 && ready.body && ready.body.postgres === "error";
-    return { ok, reason: ok ? undefined : `expected 503/postgres:error, got ${ready.status} ${JSON.stringify(ready.body)}` };
-  });
-
-  await step("Restart postgres", async () => {
-    compose("start postgres");
-    return { ok: true };
-  });
-
-  await step("Readiness recovers (postgres:ok) after restart", async () => {
-    const deadline = Date.now() + RECOVERY_TIMEOUT_MS;
-    let last;
-    while (Date.now() < deadline) {
-      last = await getReady();
-      if (last.status === 200 && last.body && last.body.postgres === "ok") {
-        return { ok: true };
-      }
-      await sleep(1000);
-    }
-    return { ok: false, reason: `did not recover within ${RECOVERY_TIMEOUT_MS}ms; last=${JSON.stringify(last)}` };
-  });
-
-  await step("Worker recovers: a real job submitted after Postgres recovery completes", async () => {
-    return createJobAndWaitForCompletion("after-postgres-outage", 30000);
-  });
-
-  // --- RabbitMQ outage ---
-  await step("Stop rabbitmq", async () => {
-    compose("stop rabbitmq");
-    return { ok: true };
-  });
-
-  await sleep(2000);
-
-  await step("API stays alive (liveness) while RabbitMQ is down", async () => {
-    const live = await getLive();
-    return { ok: live.status === 200, reason: live.status !== 200 ? `liveness returned ${live.status}` : undefined };
-  });
-
-  await step("Readiness correctly reports RabbitMQ as failing", async () => {
-    const ready = await getReady();
-    const ok = ready.status === 503 && ready.body && ready.body.rabbitmq === "error";
-    return { ok, reason: ok ? undefined : `expected 503/rabbitmq:error, got ${ready.status} ${JSON.stringify(ready.body)}` };
-  });
-
-  await step("Restart rabbitmq", async () => {
-    compose("start rabbitmq");
-    return { ok: true };
-  });
-
-  await step("Readiness recovers (rabbitmq:ok) after restart", async () => {
-    const deadline = Date.now() + RECOVERY_TIMEOUT_MS;
-    let last;
-    while (Date.now() < deadline) {
-      last = await getReady();
-      if (last.status === 200 && last.body && last.body.rabbitmq === "ok") {
-        return { ok: true };
-      }
-      await sleep(1000);
-    }
-    return { ok: false, reason: `did not recover within ${RECOVERY_TIMEOUT_MS}ms; last=${JSON.stringify(last)}` };
-  });
-
-  await step("Worker recovers: a real job submitted after RabbitMQ recovery completes", async () => {
-    return createJobAndWaitForCompletion("after-rabbitmq-outage", 30000);
-  });
+  await runOutageSequence("postgres", "postgres");
+  await runOutageSequence("rabbitmq", "rabbitmq");
 
   console.log("\n--- Summary ---");
   let allOk = true;
@@ -210,14 +296,18 @@ async function main() {
   process.exit(allOk ? 0 : 1);
 }
 
-main().catch((err) => {
-  console.error(`verify-chaos: unexpected error: ${err instanceof Error ? err.stack : String(err)}`);
-  console.error("Attempting to restore postgres/rabbitmq before exiting...");
-  try {
-    compose("start postgres");
-    compose("start rabbitmq");
-  } catch {
-    // best-effort
-  }
-  process.exit(1);
-});
+module.exports = { buildComposeCommand };
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(`verify-chaos: unexpected error: ${err instanceof Error ? err.stack : String(err)}`);
+    console.error("Attempting to restore postgres/rabbitmq before exiting...");
+    try {
+      compose("start postgres");
+      compose("start rabbitmq");
+    } catch {
+      // best-effort
+    }
+    process.exit(1);
+  });
+}

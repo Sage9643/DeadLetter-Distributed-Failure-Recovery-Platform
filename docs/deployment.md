@@ -386,7 +386,17 @@ DASHBOARD_URL=http://localhost:8080 API_KEY=<real key> node apps/api/scripts/ver
   recovers, then submits a real job and confirms the worker actually
   processes it to completion -- then repeats the same sequence for
   `rabbitmq`. Aborts immediately, before touching anything, if the
-  stack isn't already healthy at baseline.
+  stack isn't already healthy at baseline. **Requires the same
+  `--env-file` the stack was started with** (defaults to
+  `infra/.env.production`, override with `ENV_FILE=<path>`) -- a real
+  run without it found that `docker compose stop/start` cannot resolve
+  this project's required interpolated variables and fails before
+  touching any container, which (before this was fixed) let later
+  "recovers" assertions report PASS even though nothing had actually
+  gone down. The script now aborts immediately, with a clear message,
+  if `ENV_FILE` doesn't exist or if `docker compose ... config --quiet`
+  can't resolve the configuration -- and each service's "recovers"
+  assertion can only pass if the outage was genuinely observed first.
 
 Each script's own header comment has the full usage details and exact
 copy-paste commands.
