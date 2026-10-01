@@ -27,7 +27,22 @@ RUN npm run build -w apps/dashboard
 
 FROM nginx:1.27-alpine AS production
 COPY --from=build /repo/apps/dashboard/dist /usr/share/nginx/html
-COPY apps/dashboard/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Templated instead of a static conf.d file: nginx's own built-in
+# docker-entrypoint scripts (20-envsubst-on-templates.sh, included in
+# this base image) run envsubst over every file in
+# /etc/nginx/templates/*.template at container start and write the
+# result into /etc/nginx/conf.d/ with the .template suffix stripped --
+# no custom entrypoint script needed. NGINX_ENVSUBST_FILTER scopes
+# substitution to ONLY $API_ORIGIN, so nginx's own request-time
+# variables in nginx.conf.template are left untouched -- without this
+# filter, envsubst would blank those out too, since they are not
+# actually set as container environment variables. The default below
+# reproduces today's hardcoded value exactly, so this is a no-op
+# unless API_ORIGIN is explicitly overridden at deploy time.
+COPY apps/dashboard/nginx.conf.template /etc/nginx/templates/default.conf.template
+ENV API_ORIGIN=http://api:3000
+ENV NGINX_ENVSUBST_FILTER=API_ORIGIN
 
 EXPOSE 80
 

@@ -14,6 +14,14 @@
 # 14/15's real, chaos-tested reconnect/backoff logic is what keeps the
 # process itself alive and self-healing through RabbitMQ/Postgres
 # outages without needing to exit at all.
+#
+# Free-tier deployment note: a minimal, non-business HTTP listener
+# (src/health.ts) was added so this same image can also run as a
+# Render Free Web Service, which has no background-worker service type
+# and requires something listening on $PORT. This does not change the
+# reasoning above for Docker Compose: no Docker-level HEALTHCHECK is
+# added here, since the real health signal remains the RabbitMQ
+# consumer's own logs/reconnect behavior, not an HTTP probe.
 
 FROM node:22-alpine AS build
 WORKDIR /repo

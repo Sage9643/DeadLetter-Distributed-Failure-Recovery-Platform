@@ -1,9 +1,14 @@
 import { env } from "./config/env";
 import { startConsumer } from "./consumer";
+import { startHealthServer } from "./health";
 import { logger } from "./logger";
 import { closeConnection } from "./queue/connection";
 
 logger.info({ NODE_ENV: env.NODE_ENV }, "Environment loaded");
+
+// Render Free Web Service compatibility ONLY -- see src/health.ts's
+// own header comment. Does not participate in job processing.
+const healthServer = startHealthServer();
 
 let shuttingDown = false;
 
@@ -11,6 +16,7 @@ async function shutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   logger.info({ signal }, "Worker shutting down");
+  healthServer.close();
   try {
     await closeConnection();
     logger.info("RabbitMQ connection closed cleanly");

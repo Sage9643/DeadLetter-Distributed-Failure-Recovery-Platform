@@ -12,6 +12,13 @@ const envSchema = z.object({
   // instant, regardless of when each received its message. Defaults to
   // 0 (disabled). See docs/failure-handling.md, Phase 5.
   CLAIM_TEST_SYNC_EPOCH_MS: z.coerce.number().int().min(0).default(0),
+  // Render Free Web Service compatibility ONLY -- see src/health.ts.
+  // Render's free tier has no background-worker service type; only
+  // services listening on $PORT are accepted. This has no bearing on
+  // RabbitMQ connectivity, job claiming, retries, or DLX/DLQ -- all of
+  // that is unchanged. Defaults to 3001 for local/dev/Docker Compose,
+  // where nothing currently connects to this port.
+  PORT: z.coerce.number().int().positive().default(3001),
 });
 
 const parsed = envSchema.safeParse(process.env);
