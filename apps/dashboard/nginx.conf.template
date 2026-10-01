@@ -35,7 +35,17 @@ server {
 
     location /api/ {
         proxy_pass ${API_ORIGIN}/api/;
-        proxy_set_header Host $host;
+        # Real bug, Render deployment: with an HTTPS API_ORIGIN, nginx was
+        # sending the incoming dashboard Host and no SNI to the upstream,
+        # so Render's hostname/SNI-based routing could not identify the
+        # target service -- SSL_do_handshake() failed, 502. $proxy_host
+        # (nginx's own variable for proxy_pass's target host:port) is the
+        # correct upstream identity for both the Host header and the TLS
+        # SNI name; proxy_ssl_server_name must be explicitly "on" for
+        # nginx to send SNI at all (off by default).
+        proxy_ssl_server_name on;
+        proxy_ssl_name $proxy_host;
+        proxy_set_header Host $proxy_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -43,10 +53,15 @@ server {
 
     location /ws {
         proxy_pass ${API_ORIGIN}/ws;
+        # Same upstream-identity fix as /api/ above (SNI + Host must match
+        # the upstream, not the incoming dashboard host) -- see that
+        # location's comment for the full explanation.
+        proxy_ssl_server_name on;
+        proxy_ssl_name $proxy_host;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
+        proxy_set_header Host $proxy_host;
         proxy_read_timeout 3600s;
     }
 }
