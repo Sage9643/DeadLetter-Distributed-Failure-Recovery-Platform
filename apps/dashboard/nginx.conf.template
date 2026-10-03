@@ -58,6 +58,18 @@ server {
         # see the comment on `resolver` for why this matters on Render.
         set $api_upstream ${API_ORIGIN};
         proxy_pass $api_upstream$request_uri;
+        # nginx 1.27's default proxy_http_version is 1.0 (the default
+        # only became 1.1 in nginx 1.29.7). /ws below already needed to
+        # set 1.1 explicitly for the WebSocket Upgrade handshake, but
+        # /api/ never got the same treatment -- so every API request was
+        # silently being forwarded as HTTP/1.0. Render's public edge is a
+        # Host/SNI-based virtual-hosting router in front of this
+        # container; that class of infrastructure expects HTTP/1.1 and
+        # can refuse or reset an HTTP/1.0 request from a backend client,
+        # which surfaces here as a 502. nginx already defaults
+        # Connection: close for proxied requests (both 1.0 and 1.1), so
+        # no companion header change is needed.
+        proxy_http_version 1.1;
         # Real bug, Render deployment: with an HTTPS API_ORIGIN, nginx was
         # sending the incoming dashboard Host and no SNI to the upstream,
         # so Render's hostname/SNI-based routing could not identify the
