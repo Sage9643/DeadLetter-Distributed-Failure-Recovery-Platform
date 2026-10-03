@@ -34,15 +34,27 @@ COPY --from=build /repo/apps/dashboard/dist /usr/share/nginx/html
 # /etc/nginx/templates/*.template at container start and write the
 # result into /etc/nginx/conf.d/ with the .template suffix stripped --
 # no custom entrypoint script needed. NGINX_ENVSUBST_FILTER scopes
-# substitution to ONLY $API_ORIGIN, so nginx's own request-time
-# variables in nginx.conf.template are left untouched -- without this
-# filter, envsubst would blank those out too, since they are not
-# actually set as container environment variables. The default below
-# reproduces today's hardcoded value exactly, so this is a no-op
-# unless API_ORIGIN is explicitly overridden at deploy time.
+# substitution to ONLY $API_ORIGIN/$DNS_RESOLVER, so nginx's own
+# request-time variables in nginx.conf.template are left untouched --
+# without this filter, envsubst would blank those out too, since they
+# are not actually set as container environment variables. The
+# defaults below reproduce today's hardcoded values exactly, so this
+# is a no-op unless API_ORIGIN/DNS_RESOLVER are explicitly overridden
+# at deploy time.
+#
+# DNS_RESOLVER feeds nginx's `resolver` directive (see
+# nginx.conf.template), which -- together with that template's `set
+# $api_upstream ...` -- makes nginx re-resolve API_ORIGIN's hostname on
+# a TTL instead of caching it once at startup for the life of the
+# worker process. Defaults to Docker's own embedded DNS (127.0.0.11),
+# so infra/docker-compose.prod.yml's local behavior is unchanged;
+# override to a real DNS server (set in the deployment platform's own
+# environment config, not here) when API_ORIGIN points at a public
+# hostname whose backing IP(s) can change over time.
 COPY apps/dashboard/nginx.conf.template /etc/nginx/templates/default.conf.template
 ENV API_ORIGIN=http://api:3000
-ENV NGINX_ENVSUBST_FILTER=API_ORIGIN
+ENV DNS_RESOLVER=127.0.0.11
+ENV NGINX_ENVSUBST_FILTER=API_ORIGIN|DNS_RESOLVER
 
 EXPOSE 80
 

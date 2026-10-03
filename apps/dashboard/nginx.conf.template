@@ -7,18 +7,37 @@
 # apps/dashboard/Dockerfile for the ENV API_ORIGIN default and the
 # NGINX_ENVSUBST_FILTER scoping that protects nginx's own request-time
 # variables below ($host, $remote_addr, $scheme, $http_upgrade, $uri,
-# $proxy_add_x_forwarded_for) from being touched by that substitution.
-# Defaults to the Docker Compose service name (http://api:3000), so
-# infra/docker-compose.prod.yml's existing behavior is unchanged
-# unless API_ORIGIN is explicitly overridden -- e.g. for a deployment
-# where the API has its own public URL instead of a shared Docker
-# network (see docs/deployment.md).
+# $proxy_add_x_forwarded_for, $proxy_host) from being touched by that
+# substitution. Defaults to the Docker Compose service name
+# (http://api:3000), so infra/docker-compose.prod.yml's existing
+# behavior is unchanged unless API_ORIGIN is explicitly overridden --
+# e.g. for a deployment where the API has its own public URL instead
+# of a shared Docker network (see docs/deployment.md).
 
 server {
     listen 80;
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
+
+    # Render-only 502 root cause: with a literal (non-variable)
+    # proxy_pass target, nginx resolves the upstream hostname ONCE at
+    # startup and caches that IP for the life of the worker process --
+    # standard nginx behavior. Render's public *.onrender.com hostnames
+    # are served by a shared edge whose backing IP(s) are not
+    # guaranteed stable for that long; once the cached IP stops being
+    # correct, every request keeps hitting it anyway. Locally this
+    # never showed up because API_ORIGIN defaults to the Docker
+    # Compose service name "api", resolved by Docker's own embedded DNS
+    # (127.0.0.11), which is always live. The fix below (resolver +
+    # `set` variable in each location's proxy_pass) makes nginx
+    # re-resolve on the `valid` TTL instead of caching forever.
+    # DNS_RESOLVER defaults to Docker's embedded resolver so
+    # infra/docker-compose.prod.yml's behavior is unchanged; override
+    # it to a real DNS server when API_ORIGIN points at a public
+    # hostname, same as API_ORIGIN itself is overridden for that
+    # deployment.
+    resolver ${DNS_RESOLVER} valid=10s;
 
     # Static assets: long-lived, content-hashed filenames from Vite's
     # build -- safe to cache aggressively.
@@ -34,7 +53,11 @@ server {
     }
 
     location /api/ {
-        proxy_pass ${API_ORIGIN}/api/;
+        # $api_upstream (not a literal here) is what makes nginx consult
+        # the `resolver` above instead of resolving once at startup --
+        # see the comment on `resolver` for why this matters on Render.
+        set $api_upstream ${API_ORIGIN};
+        proxy_pass $api_upstream$request_uri;
         # Real bug, Render deployment: with an HTTPS API_ORIGIN, nginx was
         # sending the incoming dashboard Host and no SNI to the upstream,
         # so Render's hostname/SNI-based routing could not identify the
@@ -52,7 +75,10 @@ server {
     }
 
     location /ws {
-        proxy_pass ${API_ORIGIN}/ws;
+        # Same dynamic-resolution fix as /api/ above -- see the
+        # `resolver` and $api_upstream comments there.
+        set $api_upstream ${API_ORIGIN};
+        proxy_pass $api_upstream$request_uri;
         # Same upstream-identity fix as /api/ above (SNI + Host must match
         # the upstream, not the incoming dashboard host) -- see that
         # location's comment for the full explanation.
